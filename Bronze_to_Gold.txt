@@ -1,0 +1,246 @@
+import sys
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from awsglue.dynamicframe import DynamicFrameCollection
+from awsglue.dynamicframe import DynamicFrame
+
+# Script generated for node LogJobEnd
+def LogJobEnd(glueContext, dfc) -> DynamicFrameCollection:
+    import sys
+    import boto3
+    from awsglue.dynamicframe import DynamicFrameCollection
+    from awsglue.utils import getResolvedOptions
+
+    frame = dfc.select(list(dfc.keys())[0])
+    status = "Success"
+    error_message = ""
+    final_row_count = 0
+
+    try:
+        resolved = getResolvedOptions(sys.argv, ['JOB_NAME'])
+        job_name = resolved['JOB_NAME']
+    except Exception as e:
+        job_name = "N/A"
+        error_message += f"JOB_NAME failed: {str(e)} | "
+
+    try:
+        resolved = getResolvedOptions(sys.argv, [])
+        job_run_id = resolved.get('JOB_RUN_ID', 'N/A')
+    except Exception as e:
+        job_run_id = "N/A"
+        error_message += f"JOB_RUN_ID failed: {str(e)} | "
+
+    try:
+        resolved = getResolvedOptions(sys.argv, ['OBJECT_NAME'])
+        object_name = resolved['OBJECT_NAME']
+    except Exception as e:
+        object_name = "N/A"
+        status = "Fail"
+        error_message += f"OBJECT_NAME failed: {str(e)} | "
+
+    try:
+        resolved = getResolvedOptions(sys.argv, ['S3_TARGET_PATH'])
+        s3_target_path = resolved['S3_TARGET_PATH']
+    except Exception as e:
+        s3_target_path = "N/A"
+        status = "Fail"
+        error_message += f"S3_TARGET_PATH failed: {str(e)} | "
+
+    try:
+        final_row_count = frame.count()
+    except Exception as e:
+        status = "Fail"
+        error_message += f"Row count failed: {str(e)} | "
+
+    try:
+        src_row_count = source_row_count
+    except NameError:
+        src_row_count = "N/A"
+
+    log_line = (
+        f"JOB_SUMMARY | job_name={job_name} | job_run_id={job_run_id} | object_name={object_name} | "
+        f"s3_target_path={s3_target_path} | source_row_count={src_row_count} | "
+        f"final_row_count={final_row_count} | status={status} | error_message={error_message.strip(' |')}"
+    )
+
+    logger = glueContext.get_logger()
+    logger.info(log_line)
+
+    try:
+        s3 = boto3.client('s3')
+        s3.put_object(
+            Bucket="amzn-s3-cargill-dev",
+            Key=f"etl-logs/{job_name}/{job_run_id}.log",
+            Body=(log_line + "\n").encode("utf-8")
+        )
+    except Exception as e:
+        logger.warn(f"Failed to write log file to S3: {str(e)}")
+
+    return DynamicFrameCollection({"LogJobEnd": frame}, glueContext)
+# Script generated for node LogJobStart
+def LogJobStart(glueContext, dfc) -> DynamicFrameCollection:
+    import sys
+    from datetime import datetime
+    from awsglue.dynamicframe import DynamicFrameCollection
+    from awsglue.utils import getResolvedOptions
+
+    global pipeline_start_time
+    global source_row_count
+
+    pipeline_start_time = datetime.utcnow()
+
+    frame = dfc.select(list(dfc.keys())[0])
+    source_row_count = frame.count()
+
+    try:
+        job_name = getResolvedOptions(sys.argv, ['JOB_NAME'])['JOB_NAME']
+    except Exception:
+        job_name = "N/A (data preview)"
+
+    logger = glueContext.get_logger()
+    logger.info(
+        f"JOB_START | job_name={job_name} | "
+        f"start_time={pipeline_start_time} | source_row_count={source_row_count}"
+    )
+
+    return DynamicFrameCollection({"LogJobStart": frame}, glueContext)
+args = getResolvedOptions(sys.argv, ['JOB_NAME'])
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+job.init(args['JOB_NAME'], args)
+
+# Script generated for node Amazon S3
+AmazonS3_node1784895165040 = glueContext.create_dynamic_frame.from_options(format_options={}, connection_type="s3", format="parquet", connection_options={"paths": ["s3://amzn-s3-cargill-dev/account/"], "recurse": True}, transformation_ctx="AmazonS3_node1784895165040")
+
+# Script generated for node LogJobStart
+LogJobStart_node1785135632273 = LogJobStart(glueContext, DynamicFrameCollection({"AmazonS3_node1784895165040": AmazonS3_node1784895165040}, glueContext))
+
+# Script generated for node Select From Collection Start
+SelectFromCollectionStart_node1785136759006 = SelectFromCollection.apply(dfc=LogJobStart_node1785135632273, key=list(LogJobStart_node1785135632273.keys())[0], transformation_ctx="SelectFromCollectionStart_node1785136759006")
+
+# Script generated for node Change Schema
+ChangeSchema_node1784895259609 = ApplyMapping.apply(frame=SelectFromCollectionStart_node1785136759006, mappings=[("Id", "string", "Id", "string"), ("IsDeleted", "boolean", "IsDeleted", "boolean"), ("MasterRecordId", "null", "MasterRecordId", "null"), ("Name", "string", "Name", "string"), ("Type", "string", "Type", "string"), ("ParentId", "null", "ParentId", "null"), ("BillingStreet", "string", "BillingStreet", "string"), ("BillingCity", "string", "BillingCity", "string"), ("BillingState", "string", "BillingState", "string"), ("BillingPostalCode", "string", "BillingPostalCode", "string"), ("BillingCountry", "string", "BillingCountry", "string"), ("BillingStateCode", "string", "BillingStateCode", "string"), ("BillingCountryCode", "string", "BillingCountryCode", "string"), ("BillingLatitude", "null", "BillingLatitude", "null"), ("BillingLongitude", "null", "BillingLongitude", "null"), ("BillingGeocodeAccuracy", "null", "BillingGeocodeAccuracy", "null"), ("BillingAddress", "string", "BillingAddress", "string"), ("ShippingStreet", "string", "ShippingStreet", "string"), ("ShippingCity", "string", "ShippingCity", "string"), ("ShippingState", "string", "ShippingState", "string"), ("ShippingPostalCode", "string", "ShippingPostalCode", "string"), ("ShippingCountry", "string", "ShippingCountry", "string"), ("ShippingStateCode", "string", "ShippingStateCode", "string"), ("ShippingCountryCode", "string", "ShippingCountryCode", "string"), ("ShippingLatitude", "null", "ShippingLatitude", "null"), ("ShippingLongitude", "null", "ShippingLongitude", "null"), ("ShippingGeocodeAccuracy", "null", "ShippingGeocodeAccuracy", "null"), ("ShippingAddress", "string", "ShippingAddress", "string"), ("Phone", "string", "Phone", "string"), ("Fax", "string", "Fax", "string"), ("AccountNumber", "string", "AccountNumber", "string"), ("Website", "string", "Website", "string"), ("PhotoUrl", "string", "PhotoUrl", "string"), ("Sic", "string", "Sic", "string"), ("Industry", "string", "Industry", "string"), ("AnnualRevenue", "decimal", "AnnualRevenue", "decimal"), ("NumberOfEmployees", "int", "NumberOfEmployees", "int"), ("Ownership", "string", "Ownership", "string"), ("TickerSymbol", "string", "TickerSymbol", "string"), ("Description", "string", "Description", "string"), ("Rating", "string", "Rating", "string"), ("Site", "null", "Site", "null"), ("OwnerId", "string", "OwnerId", "string"), ("CreatedDate", "timestamp", "CreatedDate", "timestamp"), ("CreatedById", "string", "CreatedById", "string"), ("LastModifiedDate", "timestamp", "LastModifiedDate", "timestamp"), ("LastModifiedById", "string", "LastModifiedById", "string"), ("SystemModstamp", "timestamp", "SystemModstamp", "timestamp"), ("LastActivityDate", "null", "LastActivityDate", "null"), ("LastViewedDate", "null", "LastViewedDate", "null"), ("LastReferencedDate", "null", "LastReferencedDate", "null"), ("Jigsaw", "null", "Jigsaw", "null"), ("JigsawCompanyId", "null", "JigsawCompanyId", "null"), ("CleanStatus", "string", "CleanStatus", "string"), ("AccountSource", "null", "AccountSource", "null"), ("DunsNumber", "null", "DunsNumber", "null"), ("Tradestyle", "null", "Tradestyle", "null"), ("NaicsCode", "null", "NaicsCode", "null"), ("NaicsDesc", "null", "NaicsDesc", "null"), ("YearStarted", "null", "YearStarted", "null"), ("SicDesc", "null", "SicDesc", "null"), ("DandbCompanyId", "null", "DandbCompanyId", "null"), ("OperatingHoursId", "null", "OperatingHoursId", "null"), ("CustomerPriority__c", "string", "CustomerPriority__c", "string"), ("SLA__c", "string", "SLA__c", "string"), ("Active__c", "string", "Active__c", "string"), ("NumberofLocations__c", "double", "NumberofLocations__c", "double"), ("UpsellOpportunity__c", "string", "UpsellOpportunity__c", "string"), ("SLASerialNumber__c", "string", "SLASerialNumber__c", "string"), ("SLAExpirationDate__c", "date", "SLAExpirationDate__c", "date")], transformation_ctx="ChangeSchema_node1784895259609")
+
+# Script generated for node LogJobEnd
+LogJobEnd_node1785136825635 = LogJobEnd(glueContext, DynamicFrameCollection({"ChangeSchema_node1784895259609": ChangeSchema_node1784895259609}, glueContext))
+
+# Script generated for node Select From Collection End
+SelectFromCollectionEnd_node1785137516127 = SelectFromCollection.apply(dfc=LogJobEnd_node1785136825635, key=list(LogJobEnd_node1785136825635.keys())[0], transformation_ctx="SelectFromCollectionEnd_node1785137516127")
+
+# Script generated for node Amazon S3
+AmazonS3_node1784896005731 = glueContext.write_dynamic_frame.from_options(frame=SelectFromCollectionEnd_node1785137516127, connection_type="s3", format="csv", connection_options={"path": "s3://amzn-s3-cargill-dev/new_csv/", "partitionKeys": []}, transformation_ctx="AmazonS3_node1784896005731")
+
+job.commit()
+
+
+--------------------------------------------------------
+LogJobStart
+
+def LogJobStart (glueContext, dfc) -> DynamicFrameCollection:
+    import sys
+    from datetime import datetime
+    from awsglue.dynamicframe import DynamicFrameCollection
+    from awsglue.utils import getResolvedOptions
+    
+    global pipeline_start_time
+    global source_row_count
+    
+    pipeline_start_time = datetime.utcnow()
+    
+    frame = dfc.select(list(dfc.keys())[0])
+    source_row_count = frame.count()
+    
+    try:
+        job_name = getResolvedOptions(sys.argv, ['JOB_NAME'])['JOB_NAME']
+    except Exception:
+        job_name = "N/A (data preview)"
+    
+    logger = glueContext.get_logger()
+    logger.info(
+        f"JOB_START | job_name={job_name} | "
+        f"start_time={pipeline_start_time} | source_row_count={source_row_count}"
+    )
+    
+    return DynamicFrameCollection({"LogJobStart": frame}, glueContext)
+
+--------------------------------------------------------
+LogJobEnd
+
+
+def LogJobEnd (glueContext, dfc) -> DynamicFrameCollection:
+    import sys
+    import boto3
+    from awsglue.dynamicframe import DynamicFrameCollection
+    from awsglue.utils import getResolvedOptions
+    
+    frame = dfc.select(list(dfc.keys())[0])
+    status = "Success"
+    error_message = ""
+    final_row_count = 0
+    
+    try:
+        resolved = getResolvedOptions(sys.argv, ['JOB_NAME'])
+        job_name = resolved['JOB_NAME']
+    except Exception as e:
+        job_name = "N/A"
+        error_message += f"JOB_NAME failed: {str(e)} | "
+    
+    try:
+        resolved = getResolvedOptions(sys.argv, [])
+        job_run_id = resolved.get('JOB_RUN_ID', 'N/A')
+    except Exception as e:
+        job_run_id = "N/A"
+        error_message += f"JOB_RUN_ID failed: {str(e)} | "
+    
+    try:
+        resolved = getResolvedOptions(sys.argv, ['OBJECT_NAME'])
+        object_name = resolved['OBJECT_NAME']
+    except Exception as e:
+        object_name = "N/A"
+        status = "Fail"
+        error_message += f"OBJECT_NAME failed: {str(e)} | "
+    
+    try:
+        resolved = getResolvedOptions(sys.argv, ['S3_TARGET_PATH'])
+        s3_target_path = resolved['S3_TARGET_PATH']
+    except Exception as e:
+        s3_target_path = "N/A"
+        status = "Fail"
+        error_message += f"S3_TARGET_PATH failed: {str(e)} | "
+    
+    try:
+        final_row_count = frame.count()
+    except Exception as e:
+        status = "Fail"
+        error_message += f"Row count failed: {str(e)} | "
+    
+    try:
+        src_row_count = source_row_count
+    except NameError:
+        src_row_count = "N/A"
+    
+    log_line = (
+        f"JOB_SUMMARY | job_name={job_name} | job_run_id={job_run_id} | object_name={object_name} | "
+        f"s3_target_path={s3_target_path} | source_row_count={src_row_count} | "
+        f"final_row_count={final_row_count} | status={status} | error_message={error_message.strip(' |')}"
+    )
+    
+    logger = glueContext.get_logger()
+    logger.info(log_line)
+    
+    try:
+        s3 = boto3.client('s3')
+        s3.put_object(
+            Bucket="amzn-s3-cargill-dev",
+            Key=f"etl-logs/{job_name}/{job_run_id}.log",
+            Body=(log_line + "\n").encode("utf-8")
+        )
+    except Exception as e:
+        logger.warn(f"Failed to write log file to S3: {str(e)}")
+    
+    return DynamicFrameCollection({"LogJobEnd": frame}, glueContext)

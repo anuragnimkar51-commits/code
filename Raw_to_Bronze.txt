@@ -1,0 +1,171 @@
+import sys
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from awsglue.dynamicframe import DynamicFrameCollection
+from awsglue.dynamicframe import DynamicFrame
+
+# Script generated for node LogJob
+def LogJob(glueContext, dfc) -> DynamicFrameCollection:
+    import sys
+    import boto3
+    from awsglue.dynamicframe import DynamicFrameCollection
+    from awsglue.utils import getResolvedOptions
+
+    frame = dfc.select(list(dfc.keys())[0])
+    status = "Success"
+    error_message = ""
+    final_row_count = 0
+
+    try:
+        resolved = getResolvedOptions(sys.argv, ['JOB_NAME'])
+        job_name = resolved['JOB_NAME']
+    except Exception as e:
+        job_name = "N/A"
+        error_message += f"JOB_NAME failed: {str(e)} | "
+
+    try:
+        resolved = getResolvedOptions(sys.argv, [])
+        job_run_id = resolved.get('JOB_RUN_ID', 'N/A')
+    except Exception as e:
+        job_run_id = "N/A"
+        error_message += f"JOB_RUN_ID failed: {str(e)} | "
+
+    try:
+        resolved = getResolvedOptions(sys.argv, ['OBJECT_NAME'])
+        object_name = resolved['OBJECT_NAME']
+    except Exception as e:
+        object_name = "N/A"
+        status = "Fail"
+        error_message += f"OBJECT_NAME failed: {str(e)} | "
+
+    try:
+        resolved = getResolvedOptions(sys.argv, ['S3_TARGET_PATH'])
+        s3_target_path = resolved['S3_TARGET_PATH']
+    except Exception as e:
+        s3_target_path = "N/A"
+        status = "Fail"
+        error_message += f"S3_TARGET_PATH failed: {str(e)} | "
+
+    try:
+        row_count = frame.count()
+    except Exception as e:
+        status = "Fail"
+        error_message += f"Row count failed: {str(e)} | "
+
+
+    log_line = (
+        f"JOB_SUMMARY | job_name={job_name} | job_run_id={job_run_id} | object_name={object_name} | "
+        f"s3_target_path={s3_target_path} | "
+        f"row_count={row_count} | status={status} | error_message={error_message.strip(' |')}"
+    )
+
+    logger = glueContext.get_logger()
+    logger.info(log_line)
+
+    try:
+        s3 = boto3.client('s3')
+        s3.put_object(
+            Bucket="amzn-s3-cargill-dev",
+            Key=f"etl-logs/{job_name}/{job_run_id}.log",
+            Body=(log_line + "\n").encode("utf-8")
+        )
+    except Exception as e:
+        logger.warn(f"Failed to write log file to S3: {str(e)}")
+
+    return DynamicFrameCollection({"LogJobEnd": frame}, glueContext)
+args = getResolvedOptions(sys.argv, ['JOB_NAME'])
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+job.init(args['JOB_NAME'], args)
+
+# Script generated for node Salesforce
+Salesforce_node1785145892163 = glueContext.create_dynamic_frame.from_options(connection_type="salesforce", connection_options={"TRANSFER_MODE": "SYNC", "ALLOW_SKIP_COMPOUND_FIELDS": "false", "API_VERSION": "v65.0", "connectionName": "Salesforce connection", "ENTITY_NAME": "Attachment"}, transformation_ctx="Salesforce_node1785145892163")
+
+# Script generated for node LogJob
+LogJob_node1785148887714 = LogJob(glueContext, DynamicFrameCollection({"Salesforce_node1785145892163": Salesforce_node1785145892163}, glueContext))
+
+# Script generated for node Select From Collection
+SelectFromCollection_node1785148875423 = SelectFromCollection.apply(dfc=LogJob_node1785148887714, key=list(LogJob_node1785148887714.keys())[0], transformation_ctx="SelectFromCollection_node1785148875423")
+
+# Script generated for node Amazon S3
+AmazonS3_node1785145980313 = glueContext.write_dynamic_frame.from_options(frame=SelectFromCollection_node1785148875423, connection_type="s3", format="csv", connection_options={"path": "s3://amzn-s3-cargill-dev/attachment/", "partitionKeys": []}, transformation_ctx="AmazonS3_node1785145980313")
+
+job.commit()
+
+
+----------------------------------------------------------------------------------------------------------------------------------------------------------
+LogJob
+
+def LogJob (glueContext, dfc) -> DynamicFrameCollection:
+    import sys
+    import boto3
+    from awsglue.dynamicframe import DynamicFrameCollection
+    from awsglue.utils import getResolvedOptions
+    
+    frame = dfc.select(list(dfc.keys())[0])
+    status = "Success"
+    error_message = ""
+    final_row_count = 0
+    
+    try:
+        resolved = getResolvedOptions(sys.argv, ['JOB_NAME'])
+        job_name = resolved['JOB_NAME']
+    except Exception as e:
+        job_name = "N/A"
+        error_message += f"JOB_NAME failed: {str(e)} | "
+    
+    try:
+        resolved = getResolvedOptions(sys.argv, [])
+        job_run_id = resolved.get('JOB_RUN_ID', 'N/A')
+    except Exception as e:
+        job_run_id = "N/A"
+        error_message += f"JOB_RUN_ID failed: {str(e)} | "
+    
+    try:
+        resolved = getResolvedOptions(sys.argv, ['OBJECT_NAME'])
+        object_name = resolved['OBJECT_NAME']
+    except Exception as e:
+        object_name = "N/A"
+        status = "Fail"
+        error_message += f"OBJECT_NAME failed: {str(e)} | "
+    
+    try:
+        resolved = getResolvedOptions(sys.argv, ['S3_TARGET_PATH'])
+        s3_target_path = resolved['S3_TARGET_PATH']
+    except Exception as e:
+        s3_target_path = "N/A"
+        status = "Fail"
+        error_message += f"S3_TARGET_PATH failed: {str(e)} | "
+    
+    try:
+        row_count = frame.count()
+    except Exception as e:
+        status = "Fail"
+        error_message += f"Row count failed: {str(e)} | "
+    
+    
+    log_line = (
+        f"JOB_SUMMARY | job_name={job_name} | job_run_id={job_run_id} | object_name={object_name} | "
+        f"s3_target_path={s3_target_path} | "
+        f"row_count={row_count} | status={status} | error_message={error_message.strip(' |')}"
+    )
+    
+    logger = glueContext.get_logger()
+    logger.info(log_line)
+    
+    try:
+        s3 = boto3.client('s3')
+        s3.put_object(
+            Bucket="amzn-s3-cargill-dev",
+            Key=f"etl-logs/{job_name}/{job_run_id}.log",
+            Body=(log_line + "\n").encode("utf-8")
+        )
+    except Exception as e:
+        logger.warn(f"Failed to write log file to S3: {str(e)}")
+    
+    return DynamicFrameCollection({"LogJobEnd": frame}, glueContext)
