@@ -78,7 +78,6 @@ Required Glue job parameters (--arg-name value):
   --SF_LOGIN_URL          https://your-domain.my.salesforce.com
   --NUM_PARTITIONS        400
   --THREAD_POOL_SIZE      10                            (concurrent downloads per partition)
-  --REGION                us-east-1
 
 Note on SF_LOGIN_URL: auth uses the OAuth 2.0 Client Credentials Flow, which
 Salesforce only supports against an org's specific My Domain host -- the
@@ -160,7 +159,6 @@ ARGS = getResolvedOptions(
         "SF_LOGIN_URL",
         "NUM_PARTITIONS",
         "THREAD_POOL_SIZE",
-        "REGION",
     ],
 )
 
@@ -182,7 +180,6 @@ SF_API_VERSION = ARGS["SF_API_VERSION"]
 SF_LOGIN_URL = ARGS["SF_LOGIN_URL"].rstrip("/")
 NUM_PARTITIONS = int(ARGS["NUM_PARTITIONS"])
 THREAD_POOL_SIZE = int(ARGS["THREAD_POOL_SIZE"])
-REGION = ARGS["REGION"]
 
 MAX_ROW_RETRIES = 4          # per-attachment retry attempts on transient errors
 REQUEST_CONNECT_TIMEOUT = 10  # seconds, TCP connect
@@ -219,13 +216,16 @@ SF_ID_PATTERN = re.compile(r"^[a-zA-Z0-9]{15}$|^[a-zA-Z0-9]{18}$")
 # --------------------------------------------------------------------------- #
 
 
-def _load_secret(secret_name: str, region: str) -> dict:
-    client = boto3.client("secretsmanager", region_name=region)
+def _load_secret(secret_name: str) -> dict:
+    # No explicit region_name -- boto3 resolves it from the standard chain
+    # (AWS_DEFAULT_REGION / AWS_REGION env vars, or the Glue job's runtime
+    # environment), same as every other boto3 client in this script.
+    client = boto3.client("secretsmanager")
     resp = client.get_secret_value(SecretId=secret_name)
     return json.loads(resp["SecretString"])
 
 
-_sf_creds = _load_secret(SF_SECRET_NAME, REGION)
+_sf_creds = _load_secret(SF_SECRET_NAME)
 SF_CREDS_BC = sc.broadcast(_sf_creds)
 
 
@@ -410,7 +410,7 @@ def process_partition(rows):
     try:
         session = make_session(THREAD_POOL_SIZE)
         s3_client = boto3.client(
-            "s3", region_name=REGION,
+            "s3",
             config=BotoConfig(
                 max_pool_connections=THREAD_POOL_SIZE,
                 # OPTIMIZATION: explicit connect/read timeouts so a stalled
