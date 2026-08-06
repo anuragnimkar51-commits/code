@@ -1,187 +1,81 @@
 """
-AWS Glue Job: Salesforce Attachment Bulk Downloader -> S3
-============================================================
-Reads a CSV (replica of the Salesforce Attachment table, e.g. exported via a
-prior Bulk API extract) from S3, downloads each attachment's binary Body from
-Salesforce via the REST API, and lands it in S3 at:
+AWS Glue Job: Salesforce Attachment Download - Verification / Reconciliation
+==============================================================================
+Companion job to glue_sf_attachment_downloader.py. Run this AFTER the
+downloader completes for a given input batch to answer two separate
+questions:
 
-    s3://<bucket>/<root_folder>/year=<YYYY>/month=<MM>/<ParentId>/<AttachmentId>/<filename>
+  (1) MANIFEST RECONCILIATION -- do the SUCCESS + FAILED manifests fully
+      account for every row in the original input CSV, with no duplicates
+      and no silently-vanished rows?
 
-Outputs -- per-partition manifest files, written directly to S3:
-  - SUCCESS manifest (CSV): AttachmentId, ParentId, FileName, ContentType, BodyLength,
-    CreatedDate, S3RelativePath, S3AbsolutePath, Status, ErrorType, ErrorMessage,
-    Attempts, Timestamp
-  - FAILED manifest (CSV, same schema): designed to be reshaped by
-    glue_sf_attachment_retry_prep.py and re-fed into this same job as the
-    input CSV for a retry pass.
+  (2) S3 REALITY CHECK -- for every row the SUCCESS manifest claims landed
+      in S3, does the object actually exist at that key, with the byte size
+      the manifest says it has, and a key that matches what the downloader
+      would have generated from that row's ParentId/AttachmentId/CreatedDate/
+      FileName (catches a manifest that's stale/edited/mismatched vs reality)?
 
-DURABILITY OF MANIFESTS -- IMPORTANT DESIGN NOTE
---------------------------------------------------
-Manifests are written per-partition, directly via boto3, the moment that
-partition finishes -- NOT via a single spark.write.csv(...) action at the end
-of the job. This is deliberate.
+Why both: the downloader's SUCCESS manifest is trustworthy about what IT
+observed at upload time (it verified the streamed byte count against
+BodyLength before calling a row a success -- see BodyLengthMismatch handling
+in the downloader). But it can't tell you if something happened to the
+object AFTER upload (deleted by a lifecycle rule, overwritten by an unrelated
+process, bucket versioning surprises, etc.), or if the manifest CSV itself
+got corrupted/edited/partially written on its way out of Spark. This job
+re-derives ground truth independently by hitting S3 directly.
 
-Spark's file-output commit protocol is all-or-nothing PER WRITE ACTION: a
-single write() stages output from every task and only makes it visible once
-EVERY task in that job has succeeded. If even one partition (out of possibly
-hundreds) permanently fails after exhausting spark.task.maxFailures, the
-entire write is aborted -- and with 4M+ rows spread across many partitions,
-that means the other 99%+ of successfully-processed rows would have no
-manifest at all, even though their attachments are already sitting safely in
-S3 (attachment uploads are a direct side effect of process_row, independent
-of Spark's commit protocol, and are never rolled back by a Spark failure).
+Outputs (all under VERIFICATION_OUTPUT_PATH):
+  - summary/<job_name>_<ts>.json
+      Single JSON: manifest reconciliation counts + S3 verification counts
+      + a breakdown of failure reasons, so you can eyeball pass/fail without
+      opening any CSV.
+  - discrepancies/manifest/  (CSV)
+      Rows from the manifest reconciliation step that are NOT clean:
+      MISSING_FROM_MANIFESTS (input row with no matching success/failed row),
+      DUPLICATE_IN_SUCCESS, DUPLICATE_IN_FAILED, DUPLICATE_ACROSS_SUCCESS_AND_FAILED.
+  - discrepancies/s3/  (CSV)
+      SUCCESS-manifest rows where the S3 reality check failed:
+      MISSING_IN_S3, SIZE_MISMATCH, KEY_MISMATCH, HEAD_ERROR.
 
-Writing one small manifest file per partition, right when that partition
-finishes, decouples manifest durability from whether every other partition
-in the job also succeeds. A partition that fails simply has no manifest file
-for that partition_id/run_id; every partition that succeeded still has one.
+Nothing here mutates S3 or the manifests -- this is read-only, safe to run
+repeatedly, and safe to run in parallel with a retry pass against the SAME
+manifests (though not against manifests a concurrent run is still writing).
 
-Each file is written to a deterministic, run-scoped key:
-    <SUCCESS_OR_FAILED_OUTPUT_PATH>/run=<JOB_RUN_ID>/part-<partition_id>.csv
-The run=<JOB_RUN_ID> segment is Hive-partition-style, so a downstream
-retry-prep job reading spark.read.csv(FAILED_OUTPUT_PATH) will still pick up
-every part file across every run automatically (and gets a free "run" column
-for free). Within a single run, the (run_id, partition_id) pair is stable
-across Spark task retries, so a retried partition simply overwrites its own
-prior (failed/partial) attempt at the same key rather than creating a
-duplicate file.
-
-Edge cases explicitly handled:
-  - Malformed/corrupt CSV rows (wrong column count, bad quoting) are captured
-    via Spark's PERMISSIVE CSV mode. Rather than being filtered out and
-    written via a separate (also all-or-nothing) Spark write, they now flow
-    through the SAME per-partition pipeline as every other row and are
-    routed straight to that partition's FAILED manifest -- no Salesforce
-    call attempted, since there's nothing valid to look up.
-  - Empty input file / empty partitions short-circuit without wasting a
-    Salesforce login call.
-  - A Salesforce login failure at the start of a partition (bad creds, network
-    down) marks every row in that partition as FAILED with AuthFailure/
-    SetupFailure instead of raising and killing the Spark task (which would
-    otherwise retry the whole partition up to spark.task.maxFailures times
-    and can abort the job).
-  - Malformed Salesforce IDs (wrong length/charset) are rejected before making
-    an API call, saving a wasted round trip.
-  - Salesforce's *daily* API limit (403 REQUEST_LIMIT_EXCEEDED) is treated
-    differently from a transient rate limit (429): it's not retryable within
-    the run, and a per-partition flag short-circuits remaining rows in that
-    partition once it's hit, rather than burning through retries row by row.
-  - Attachment bodies are streamed directly to S3 (not buffered fully into
-    memory) so large files don't blow up memory under thread concurrency.
-  - The number of bytes actually streamed to S3 for each attachment is
-    compared against the source row's BodyLength; a mismatch (truncated
-    download, proxy interference, etc.) is treated as a retryable failure
-    rather than silently landing a corrupt/incomplete file as a "success".
-  - S3 key length (1024-byte AWS limit) is respected by dynamically truncating
-    the filename based on how much of the key the folder path already uses.
-  - Zero-byte attachments are treated as a valid success, not an error.
-
-Designed for 4M+ rows:
-  - No driver-side collect(); everything flows through Spark RDD/DataFrame ops
-    and a single foreachPartition() action (no result data is shipped back to
-    the driver -- manifests are written directly from each executor).
-  - Salesforce auth + requests.Session (HTTP keep-alive + urllib3 Retry) created
-    ONCE PER PARTITION, not per row -> avoids re-login storms and re-establishes
-    TCP connections efficiently.
-  - Within each partition, rows are processed concurrently via a ThreadPoolExecutor
-    (THREAD_POOL_SIZE threads), using a SLIDING WINDOW of in-flight futures rather
-    than fixed batches -- a completed row immediately frees a worker slot for the
-    next row instead of the whole pool stalling on the slowest row in a batch.
-  - boto3 S3 client created once per partition (boto3 clients are not
-    picklable/shareable across the driver->executor boundary, so never create
-    them in the driver and pass them in). Client is thread-safe and shared across
-    the partition's thread pool, and is reused for the final manifest upload.
-    Explicit connect/read timeouts are set so a stalled connection can't hang
-    a partition indefinitely.
-  - S3 uploads use an explicit TransferConfig with a capped internal thread count.
-    Without this, boto3's default multipart upload spins up its own thread pool
-    (default max_concurrency=10) INSIDE each of our THREAD_POOL_SIZE row-worker
-    threads -- i.e. up to THREAD_POOL_SIZE x 10 OS threads per partition just for
-    uploads, competing for the same CPU/network the row workers need.
-  - Exponential backoff w/ jitter on transient Salesforce/S3 errors (429/5xx).
-  - Partition count AND thread pool size are both tunable to respect Salesforce
-    concurrent API limits: effective concurrency ≈ NUM_PARTITIONS_IN_FLIGHT *
-    THREAD_POOL_SIZE, so turn down whichever knob keeps you under your org's limit.
-  - The input CSV is read and repartitioned in a single pass -- there is no
-    longer a need to cache/re-scan it, since corrupt-row handling now happens
-    inline in the same per-partition worker as everything else.
+Sampling: for very large batches, checking every SUCCESS row against S3 with
+a HEAD request is the single most expensive part of this job (one API call
+per row). SAMPLE_RATE lets you check a statistical subset instead of 100%
+when you just want ongoing confidence rather than an exhaustive audit --
+set it to 1.0 for a full audit (e.g. before a compliance sign-off).
 
 Required Glue job parameters (--arg-name value):
-  --INPUT_CSV_PATH        s3://your-bucket/input/attachment_replica.csv
-  --OUTPUT_BUCKET         your-output-bucket
-  --ATTACHMENT_ROOT       sf-attachments               (root "parent folder")
-  --SUCCESS_OUTPUT_PATH   s3://your-output-bucket/manifests/success/
-  --FAILED_OUTPUT_PATH    s3://your-output-bucket/manifests/failed/
-  --SF_SECRET_NAME        salesforce/attachment-etl    (AWS Secrets Manager secret)
-  --SF_API_VERSION        v60.0
-  --SF_LOGIN_URL          https://your-domain.my.salesforce.com
-  --NUM_PARTITIONS        200
-  --THREAD_POOL_SIZE      10                            (concurrent downloads per partition)
-
-JOB_RUN_ID is not something you need to pass -- AWS Glue injects it
-automatically into every job run's arguments, and it's used here to scope
-manifest file paths per run (see "DURABILITY OF MANIFESTS" above). If this
-script is ever run outside the Glue service (e.g. local spark-submit testing)
-where JOB_RUN_ID isn't present, it falls back to a random id.
-
-Note on SF_LOGIN_URL: auth uses the OAuth 2.0 Client Credentials Flow, which
-Salesforce only supports against an org's specific My Domain host -- the
-generic https://login.salesforce.com / https://test.salesforce.com hosts do
-NOT work for this grant type. Use your org's My Domain URL.
-
-Recommended Glue/Spark setting for this job:
-  --conf spark.speculation=false
-  Speculative execution can launch a duplicate copy of a slow task. Since this
-  job's tasks perform real side effects (S3 uploads + manifest writes) rather
-  than pure functions, a speculative re-run risks two copies of the same
-  partition uploading/writing concurrently. Turning speculation off avoids
-  that; it's not set inside this script because it's a cluster-level setting,
-  not a job argument.
-
-Secrets Manager secret (JSON) -- OAuth 2.0 Client Credentials Flow, backed by
-a connected app configured with a "Run As" integration user in Salesforce:
-    {"client_id": "...", "client_secret": "..."}
-
-Input CSV expected columns (case-sensitive; matches a full Attachment object
-extract -- Body itself is excluded since it's fetched per-row via the REST
-API, not carried in the CSV):
-  Id, ParentId, Name, IsPrivate, ContentType, BodyLength, OwnerId,
-  CreatedDate, CreatedById, LastModifiedDate, LastModifiedById,
-  SystemModstamp, IsDeleted, Description
-  - "Id" = Salesforce AttachmentId (18-char)
-  - "CreatedDate" used to compute year=/month= partitioning; ISO 8601 string
-  - "BodyLength" used to verify the downloaded/uploaded byte count matches
-    what Salesforce recorded for the attachment
-  - Only Id, ParentId, Name, ContentType, BodyLength, and CreatedDate are
-    actually used for processing; the remaining columns are accepted so the
-    CSV can be a straight, unmodified extract of the Attachment table, but
-    are dropped before processing (see the .select(...) in main()) to keep
-    the per-partition shuffle payload small.
+  --INPUT_CSV_PATH             s3://your-bucket/input/attachment_replica.csv
+                                (the SAME input the downloader was run against)
+  --SUCCESS_OUTPUT_PATH        s3://your-output-bucket/manifests/success/
+  --FAILED_OUTPUT_PATH         s3://your-output-bucket/manifests/failed/
+  --OUTPUT_BUCKET               your-output-bucket        (where attachments landed)
+  --ATTACHMENT_ROOT              sf-attachments            (must match downloader)
+  --VERIFICATION_OUTPUT_PATH   s3://your-output-bucket/verification/
+  --NUM_PARTITIONS              200
+  --THREAD_POOL_SIZE            20                          (concurrent HEAD requests/partition)
+  --SAMPLE_RATE                 1.0                          (0.0-1.0; 1.0 = check every SUCCESS row)
 """
 
 import sys
-import io
-import csv
 import re
 import json
-import uuid
-import time
 import random
 import logging
-import threading
 import itertools
 import datetime as dt
 from concurrent.futures import ThreadPoolExecutor, FIRST_COMPLETED, wait
 
 import boto3
 from botocore.config import Config as BotoConfig
-from boto3.s3.transfer import TransferConfig
-import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
+from botocore.exceptions import ClientError
 
 from pyspark.context import SparkContext
-from pyspark import TaskContext
+from pyspark.sql import SparkSession, Row
+from pyspark.sql import functions as F
 from pyspark.sql.types import StructType, StructField, StringType, LongType
 
 from awsglue.context import GlueContext
@@ -197,15 +91,14 @@ ARGS = getResolvedOptions(
     [
         "JOB_NAME",
         "INPUT_CSV_PATH",
-        "OUTPUT_BUCKET",
-        "ATTACHMENT_ROOT",
         "SUCCESS_OUTPUT_PATH",
         "FAILED_OUTPUT_PATH",
-        "SF_SECRET_NAME",
-        "SF_API_VERSION",
-        "SF_LOGIN_URL",
+        "OUTPUT_BUCKET",
+        "ATTACHMENT_ROOT",
+        "VERIFICATION_OUTPUT_PATH",
         "NUM_PARTITIONS",
         "THREAD_POOL_SIZE",
+        "SAMPLE_RATE",
     ],
 )
 
@@ -216,114 +109,55 @@ job = Job(glueContext)
 job.init(ARGS["JOB_NAME"], ARGS)
 
 logger = glueContext.get_logger()
+_executor_log = logging.getLogger("sf_attachment_verifier")
 
 INPUT_CSV_PATH = ARGS["INPUT_CSV_PATH"]
-OUTPUT_BUCKET = ARGS["OUTPUT_BUCKET"]
-ATTACHMENT_ROOT = ARGS["ATTACHMENT_ROOT"].strip("/")
 SUCCESS_OUTPUT_PATH = ARGS["SUCCESS_OUTPUT_PATH"]
 FAILED_OUTPUT_PATH = ARGS["FAILED_OUTPUT_PATH"]
-SF_SECRET_NAME = ARGS["SF_SECRET_NAME"]
-SF_API_VERSION = ARGS["SF_API_VERSION"]
-SF_LOGIN_URL = ARGS["SF_LOGIN_URL"].rstrip("/")
+OUTPUT_BUCKET = ARGS["OUTPUT_BUCKET"]
+ATTACHMENT_ROOT = ARGS["ATTACHMENT_ROOT"].strip("/")
+VERIFICATION_OUTPUT_PATH = ARGS["VERIFICATION_OUTPUT_PATH"]
 NUM_PARTITIONS = int(ARGS["NUM_PARTITIONS"])
 THREAD_POOL_SIZE = int(ARGS["THREAD_POOL_SIZE"])
+SAMPLE_RATE = float(ARGS["SAMPLE_RATE"])
 
-# Glue injects --JOB_RUN_ID automatically for real job runs. Fall back to a
-# random id so the script still runs standalone (e.g. local testing).
-try:
-    JOB_RUN_ID = getResolvedOptions(sys.argv, ["JOB_RUN_ID"])["JOB_RUN_ID"]
-except Exception:
-    JOB_RUN_ID = f"local-{uuid.uuid4().hex[:12]}"
-
-MAX_ROW_RETRIES = 4          # per-attachment retry attempts on transient errors
-REQUEST_CONNECT_TIMEOUT = 10  # seconds, TCP connect
-REQUEST_READ_TIMEOUT = 60     # seconds, waiting on response bytes
-BACKOFF_BASE = 1.5           # seconds
-MAX_S3_KEY_BYTES = 1024      # AWS hard limit
-S3_KEY_SAFETY_MARGIN = 16    # leave headroom for encoding edge cases
-
-# OPTIMIZATION: how many rows a partition keeps "in flight" across its
-# ThreadPoolExecutor at once. Deliberately a small multiple of THREAD_POOL_SIZE
-# (not a large fixed batch) -- see the sliding-window executor below for why.
+REQUEST_CONNECT_TIMEOUT = 10
+REQUEST_READ_TIMEOUT = 30
 MAX_IN_FLIGHT_MULTIPLIER = 2
 
-# OPTIMIZATION: explicit, capped transfer config for S3 uploads. use_threads
-# stays True (multipart still benefits big files) but max_concurrency is
-# capped low, since real concurrency in this job already comes from
-# THREAD_POOL_SIZE row-level workers -- letting every one of those workers
-# also spin up boto3's default 10-thread multipart pool multiplies OS thread
-# count by 10x per partition for no throughput benefit.
-S3_TRANSFER_CONFIG = TransferConfig(
-    multipart_threshold=8 * 1024 * 1024,
-    multipart_chunksize=8 * 1024 * 1024,
-    max_concurrency=2,
-    use_threads=True,
-)
-
-# Salesforce record IDs are always 15 (case-sensitive) or 18
-# (case-insensitive, checksum-suffixed) alphanumeric characters.
-SF_ID_PATTERN = re.compile(r"^[a-zA-Z0-9]{15}$|^[a-zA-Z0-9]{18}$")
-
-# Column order for every manifest CSV (success and failed alike).
-RESULT_FIELDS = [
-    "AttachmentId", "ParentId", "FileName", "ContentType", "BodyLength",
-    "CreatedDate", "S3RelativePath", "S3AbsolutePath", "Status", "ErrorType",
-    "ErrorMessage", "Attempts", "Timestamp",
-]
+_INVALID_FS_CHARS = re.compile(r'[\\/:*?"<>|\x00-\x1f]')
+MAX_S3_KEY_BYTES = 1024
+S3_KEY_SAFETY_MARGIN = 16
 
 
-def parse_s3_uri(uri: str):
-    """s3://bucket/some/prefix/ -> ('bucket', 'some/prefix/')."""
-    if not uri.startswith("s3://"):
-        raise ValueError(f"Expected an s3:// URI, got: {uri}")
-    without_scheme = uri[len("s3://"):]
+def parse_s3_path(s3_path: str):
+    if not s3_path.startswith("s3://"):
+        raise ValueError(f"Expected an s3:// path, got: {s3_path}")
+    without_scheme = s3_path[len("s3://"):]
     bucket, _, prefix = without_scheme.partition("/")
     if not bucket:
-        raise ValueError(f"Could not parse a bucket name out of: {uri}")
-    if prefix and not prefix.endswith("/"):
-        prefix += "/"
-    return bucket, prefix
+        raise ValueError(f"Could not parse bucket from path: {s3_path}")
+    return bucket, prefix.strip("/")
 
 
-# Parsed once on the driver -- these are plain strings, cheaply captured by
-# closures in functions shipped to executors (same pattern already used for
-# OUTPUT_BUCKET, ATTACHMENT_ROOT, etc.).
-SUCCESS_BUCKET, SUCCESS_PREFIX = parse_s3_uri(SUCCESS_OUTPUT_PATH)
-FAILED_BUCKET, FAILED_PREFIX = parse_s3_uri(FAILED_OUTPUT_PATH)
-
-# Driver-side accumulators for a final informational count in the job log.
-# NOTE: these are for logging only, not correctness -- the manifests written
-# to S3 are the source of truth. Under a genuine (non-speculative) task
-# retry, an accumulator update from the failed attempt is not guaranteed to
-# be excluded, so these numbers can, in rare cases, overcount slightly.
-SUCCESS_ACC = sc.accumulator(0)
-FAILED_ACC = sc.accumulator(0)
-
-# --------------------------------------------------------------------------- #
-# Secrets (fetched once in the driver, then broadcast -- avoids 4M
-# Secrets Manager calls, one per row/partition)
-# --------------------------------------------------------------------------- #
+def derive_job_name(input_path: str) -> str:
+    base = input_path.rstrip("/").split("/")[-1]
+    if "." in base:
+        base = base.rsplit(".", 1)[0]
+    base = re.sub(r"[^A-Za-z0-9._-]", "_", base)
+    return base or "unknown_input"
 
 
-def _load_secret(secret_name: str) -> dict:
-    # No explicit region_name -- boto3 resolves it from the standard chain
-    # (AWS_DEFAULT_REGION / AWS_REGION env vars, or the Glue job's runtime
-    # environment), same as every other boto3 client in this script.
-    client = boto3.client("secretsmanager")
-    resp = client.get_secret_value(SecretId=secret_name)
-    return json.loads(resp["SecretString"])
-
-
-_sf_creds = _load_secret(SF_SECRET_NAME)
-SF_CREDS_BC = sc.broadcast(_sf_creds)
+JOB_NAME = derive_job_name(INPUT_CSV_PATH)
+VERIFY_BUCKET, VERIFY_PREFIX = parse_s3_path(VERIFICATION_OUTPUT_PATH)
 
 
 # --------------------------------------------------------------------------- #
-# Helpers
+# Same key-derivation logic as the downloader -- duplicated deliberately
+# (not imported) so this job can independently recompute what a row's S3 key
+# SHOULD be and catch a manifest whose S3RelativePath disagrees with what the
+# downloader's own logic would have produced.
 # --------------------------------------------------------------------------- #
-
-_INVALID_FS_CHARS = re.compile(r'[\\/:*?"<>|\x00-\x1f]')
-
 
 def sanitize_filename(name: str, fallback: str) -> str:
     if not name:
@@ -332,17 +166,11 @@ def sanitize_filename(name: str, fallback: str) -> str:
     return name if name else fallback
 
 
-def is_valid_sf_id(value: str) -> bool:
-    return bool(value) and bool(SF_ID_PATTERN.match(value))
-
-
 def parse_year_month(created_date: str):
-    """Return (yyyy, mm) strings from an ISO-ish Salesforce CreatedDate."""
     if not created_date:
         now = dt.datetime.utcnow()
         return f"{now.year:04d}", f"{now.month:02d}"
     try:
-        # Salesforce CreatedDate typically: 2024-01-05T12:34:56.000+0000
         cleaned = created_date.replace("Z", "+00:00")
         parsed = dt.datetime.fromisoformat(cleaned[:19])
         return f"{parsed.year:04d}", f"{parsed.month:02d}"
@@ -351,17 +179,12 @@ def parse_year_month(created_date: str):
         return f"{now.year:04d}", f"{now.month:02d}"
 
 
-def build_s3_key(root: str, year: str, month: str, parent_id: str,
-                  attachment_id: str, filename: str) -> str:
-    """Builds the S3 key, truncating the filename (preserving its extension)
-    if the full key would exceed S3's 1024-byte key length limit."""
+def build_expected_s3_key(root, year, month, parent_id, attachment_id, filename):
     prefix = f"{root}/year={year}/month={month}/{parent_id}/{attachment_id}/"
     budget = MAX_S3_KEY_BYTES - S3_KEY_SAFETY_MARGIN - len(prefix.encode("utf-8"))
-
     encoded = filename.encode("utf-8")
     if len(encoded) <= budget:
         return prefix + filename
-
     stem, dot, ext = filename.rpartition(".")
     ext_suffix = f".{ext}" if dot else ""
     stem_budget = max(1, budget - len(ext_suffix.encode("utf-8")))
@@ -370,419 +193,16 @@ def build_s3_key(root: str, year: str, month: str, parent_id: str,
     return prefix + truncated_stem + ext_suffix
 
 
-class _CountingStream:
-    """Wraps a readable stream and counts bytes read through it.
-
-    Used to verify the number of bytes actually streamed to S3 matches the
-    source row's BodyLength, without buffering the whole attachment body in
-    memory just to check its size."""
-
-    def __init__(self, stream):
-        self._stream = stream
-        self.bytes_read = 0
-        self._lock = threading.Lock()
-
-    def read(self, amt=None):
-        chunk = self._stream.read(amt) if amt is not None else self._stream.read()
-        if chunk:
-            with self._lock:
-                self.bytes_read += len(chunk)
-        return chunk
-
-    def __getattr__(self, name):
-        # Delegate anything else (e.g. urllib3's .close(), .closed) to the
-        # wrapped stream so upload_fileobj can treat this as a drop-in
-        # replacement for resp.raw.
-        return getattr(self._stream, name)
-
-
-def sf_login(creds: dict, login_url: str):
-    """OAuth 2.0 Client Credentials Flow login -> (access_token, instance_url).
-
-    No username/password/security token/refresh token involved -- auth is
-    just client_id + client_secret against a connected app configured with a
-    "Run As" integration user in Salesforce. login_url MUST be the org's
-    specific My Domain host (e.g. https://your-domain.my.salesforce.com);
-    the generic login/test.salesforce.com hosts don't support this grant."""
-    token_url = f"{login_url}/services/oauth2/token"
-    payload = {
-        "grant_type": "client_credentials",
-        "client_id": creds["client_id"],
-        "client_secret": creds["client_secret"],
-    }
-
-    resp = requests.post(
-        token_url, data=payload,
-        timeout=(REQUEST_CONNECT_TIMEOUT, REQUEST_READ_TIMEOUT),
-    )
-    resp.raise_for_status()
-    data = resp.json()
-    return data["access_token"], data["instance_url"]
-
-
 # --------------------------------------------------------------------------- #
-# One-time Salesforce login on the DRIVER, broadcast to all executors.
+# Step 1: MANIFEST RECONCILIATION (pure Spark DataFrame ops, no S3 calls)
 # --------------------------------------------------------------------------- #
-# Without this, each of the NUM_PARTITIONS partitions would call sf_login()
-# independently on first use -- e.g. 400 login API calls for a 400-partition
-# job, purely to obtain what is functionally the same session token. Logging
-# in once here and broadcasting the token cuts that to a single call; each
-# partition only calls sf_login() again later, lazily, if it actually hits a
-# 401 (token expired/revoked mid-run) -- see relogin_if_stale() below.
+# Purely checks that the CSVs are internally consistent with each other and
+# with the original input -- catches things like a Spark write that got cut
+# off, a retry pass whose output got unioned into the wrong manifest folder,
+# or speculative-execution duplicates if spark.speculation was accidentally
+# left on for a run.
 
-try:
-    _initial_access_token, _initial_instance_url = sf_login(_sf_creds, SF_LOGIN_URL)
-except Exception as e:
-    logger.error(f"Initial Salesforce login failed -- aborting job: {e}")
-    raise
-
-SF_AUTH_BC = sc.broadcast({
-    "access_token": _initial_access_token,
-    "instance_url": _initial_instance_url,
-})
-
-
-def make_session(pool_size: int) -> requests.Session:
-    """HTTP session with connection pooling. Status-code retries (429/5xx) are
-    intentionally NOT configured here -- our own per-row retry loop already
-    handles those with application-aware backoff (and special-cases 401/403/404).
-    Stacking urllib3's status retries on top would multiply retry attempts
-    (MAX_ROW_RETRIES x urllib3 retries) and hammer Salesforce harder than
-    intended. We only let urllib3 retry pure connection-level failures
-    (refused/reset connections, DNS blips) since those aren't visible to our
-    row-level loop until the exception surfaces."""
-    session = requests.Session()
-    retry = Retry(
-        total=None,
-        connect=2,
-        read=2,
-        status=0,               # don't retry on HTTP status codes here
-        backoff_factor=0.5,
-        respect_retry_after_header=True,
-    )
-    adapter = HTTPAdapter(max_retries=retry, pool_connections=pool_size, pool_maxsize=pool_size)
-    session.mount("https://", adapter)
-    session.mount("http://", adapter)
-    return session
-
-
-def _corrupt_row_dict(row) -> dict:
-    """Malformed CSV rows never had a usable Id/ParentId in the first place,
-    so route straight to FAILED without attempting any Salesforce call."""
-    return {
-        "AttachmentId": None, "ParentId": None, "FileName": None,
-        "ContentType": None, "BodyLength": None, "CreatedDate": None,
-        "S3RelativePath": None, "S3AbsolutePath": None, "Status": "FAILED",
-        "ErrorType": "MalformedCsvRow",
-        "ErrorMessage": (row["_corrupt_record"] or "")[:1000],
-        "Attempts": 0, "Timestamp": dt.datetime.utcnow().isoformat(),
-    }
-
-
-def _write_manifest_csv(s3_client, bucket: str, prefix: str, partition_id: int, rows: list):
-    """Writes one partition's worth of manifest rows as a single CSV object,
-    directly via boto3 -- this IS the durability mechanism described in the
-    module docstring, so this function deliberately does not go through
-    Spark's DataFrame writer / file commit protocol at all."""
-    if not rows:
-        return
-    buf = io.StringIO()
-    writer = csv.DictWriter(buf, fieldnames=RESULT_FIELDS)
-    writer.writeheader()
-    for r in rows:
-        writer.writerow(r)
-    key = f"{prefix}run={JOB_RUN_ID}/part-{partition_id:05d}.csv"
-    s3_client.put_object(
-        Bucket=bucket, Key=key,
-        Body=buf.getvalue().encode("utf-8"),
-        ContentType="text/csv",
-    )
-
-
-# --------------------------------------------------------------------------- #
-# Partition-level worker
-# --------------------------------------------------------------------------- #
-
-def process_partition(rows):
-    """Runs once per Spark partition, entirely on an executor. Downloads and
-    uploads every attachment in this partition, then writes this partition's
-    SUCCESS/FAILED manifest rows directly to S3. Returns nothing -- intended
-    to be used with rdd.foreachPartition(), not mapPartitions(), since no
-    data needs to flow back to the driver."""
-    row_iter = iter(rows)
-    try:
-        first_row = next(row_iter)
-    except StopIteration:
-        return  # empty partition -- nothing to do
-    row_iter = itertools.chain([first_row], row_iter)
-
-    tc = TaskContext.get()
-    partition_id = tc.partitionId() if tc is not None else random.randint(0, 999_999)
-
-    creds = SF_CREDS_BC.value
-    success_rows = []
-    failed_rows = []
-
-    # Session/S3-client construction failures must NOT raise here: an
-    # uncaught exception in foreachPartition fails the Spark task, which
-    # Spark then retries and can eventually abort the whole job. Note there
-    # is deliberately NO Salesforce login call in this block -- auth_state is
-    # seeded from the token the driver already obtained once and broadcast
-    # (SF_AUTH_BC), so a partition that never needs to re-authenticate makes
-    # zero login calls of its own.
-    try:
-        session = make_session(THREAD_POOL_SIZE)
-        s3_client = boto3.client(
-            "s3",
-            config=BotoConfig(
-                max_pool_connections=THREAD_POOL_SIZE,
-                connect_timeout=REQUEST_CONNECT_TIMEOUT,
-                read_timeout=REQUEST_READ_TIMEOUT,
-            ),
-        )
-        auth_state = dict(SF_AUTH_BC.value)  # local copy; never mutate the broadcast value itself
-    except Exception as e:  # noqa: BLE001
-        err_msg = str(e)[:500]
-        ts = dt.datetime.utcnow().isoformat()
-        for row in row_iter:
-            failed_rows.append({
-                "AttachmentId": (row["Id"] or "").strip(), "ParentId": (row["ParentId"] or "").strip(),
-                "FileName": (row["Name"] or "").strip(), "ContentType": row["ContentType"],
-                "BodyLength": row["BodyLength"], "CreatedDate": row["CreatedDate"],
-                "S3RelativePath": None, "S3AbsolutePath": None, "Status": "FAILED",
-                "ErrorType": "SetupFailure", "ErrorMessage": f"Partition setup failed: {err_msg}",
-                "Attempts": 0, "Timestamp": ts,
-            })
-        # Best-effort: try a fresh, minimal client just for the manifest
-        # write, since the one above may itself have failed to construct.
-        try:
-            _write_manifest_csv(boto3.client("s3"), FAILED_BUCKET, FAILED_PREFIX, partition_id, failed_rows)
-        except Exception as write_err:  # noqa: BLE001
-            print(f"[partition {partition_id}] failed to write FAILED manifest after setup failure: {write_err}")
-        FAILED_ACC.add(len(failed_rows))
-        return
-
-    auth_lock = threading.Lock()
-    # Set when Salesforce's DAILY org-wide API limit is hit (403
-    # REQUEST_LIMIT_EXCEEDED). That's not retryable within this run, and
-    # every subsequent call will fail the same way -- so once set, remaining
-    # rows in this partition fail fast instead of each burning MAX_ROW_RETRIES
-    # attempts against an exhausted quota.
-    org_limit_hit = threading.Event()
-
-    def relogin_if_stale(token_seen: str):
-        """Re-auth only if no other thread has already refreshed the token
-        since this thread last saw it (avoids redundant re-logins when many
-        threads hit a 401 around the same time -- at most one sf_login() call
-        per stale-token event, not one per thread). Raises if the re-login
-        itself fails (bad/revoked creds); callers treat that as a normal
-        per-row failure rather than crashing the partition."""
-        with auth_lock:
-            if auth_state["access_token"] == token_seen:
-                auth_state["access_token"], auth_state["instance_url"] = sf_login(creds, SF_LOGIN_URL)
-            return auth_state["access_token"], auth_state["instance_url"]
-
-    def process_row(row) -> dict:
-        attachment_id = (row["Id"] or "").strip()
-        parent_id = (row["ParentId"] or "").strip()
-        raw_name = (row["Name"] or "").strip()
-        content_type = (row["ContentType"] or "application/octet-stream").strip()
-        body_length = row["BodyLength"]
-        created_date = row["CreatedDate"]
-
-        def fail(error_type, error_message, attempts=0, filename=None):
-            return {
-                "AttachmentId": attachment_id, "ParentId": parent_id,
-                "FileName": filename or raw_name, "ContentType": content_type, "BodyLength": body_length,
-                "CreatedDate": created_date, "S3RelativePath": None, "S3AbsolutePath": None,
-                "Status": "FAILED", "ErrorType": error_type, "ErrorMessage": error_message,
-                "Attempts": attempts, "Timestamp": dt.datetime.utcnow().isoformat(),
-            }
-
-        if not is_valid_sf_id(attachment_id):
-            return fail("ValidationError", f"Malformed AttachmentId: '{attachment_id}'")
-        if not is_valid_sf_id(parent_id):
-            return fail("ValidationError", f"Malformed ParentId: '{parent_id}'")
-
-        filename = sanitize_filename(raw_name, f"{attachment_id}.bin")
-        year, month = parse_year_month(created_date)
-        s3_key = build_s3_key(ATTACHMENT_ROOT, year, month, parent_id, attachment_id, filename)
-        s3_abs_path = f"s3://{OUTPUT_BUCKET}/{s3_key}"
-
-        if org_limit_hit.is_set():
-            return fail("OrgApiLimitExceeded",
-                        "Salesforce daily API request limit already exceeded this run; skipped without calling out")
-
-        last_error_type, last_error_msg = None, None
-        success = False
-        attempt = 0
-
-        for attempt in range(1, MAX_ROW_RETRIES + 1):
-            if org_limit_hit.is_set():
-                last_error_type, last_error_msg = "OrgApiLimitExceeded", "Daily API limit hit mid-retry"
-                break
-
-            token, instance_url = auth_state["access_token"], auth_state["instance_url"]
-            download_url = f"{instance_url}/services/data/{SF_API_VERSION}/sobjects/Attachment/{attachment_id}/Body"
-            resp = None
-            try:
-                resp = session.get(
-                    download_url, headers={"Authorization": f"Bearer {token}"},
-                    timeout=(REQUEST_CONNECT_TIMEOUT, REQUEST_READ_TIMEOUT),
-                    stream=True,
-                )
-
-                if resp.status_code == 401:
-                    # token expired mid-partition -> re-auth (once, across
-                    # threads) and retry
-                    relogin_if_stale(token)
-                    last_error_type, last_error_msg = "AuthExpired", "401 - re-authenticated, retrying"
-                    time.sleep(BACKOFF_BASE * attempt + random.uniform(0, 0.5))
-                    continue
-
-                if resp.status_code == 403:
-                    error_code = None
-                    try:
-                        body = resp.json()
-                        if isinstance(body, list) and body:
-                            error_code = body[0].get("errorCode")
-                    except Exception:
-                        pass
-                    if error_code == "REQUEST_LIMIT_EXCEEDED":
-                        org_limit_hit.set()
-                        last_error_type = "OrgApiLimitExceeded"
-                        last_error_msg = "Salesforce daily API request limit exceeded (403 REQUEST_LIMIT_EXCEEDED)"
-                    else:
-                        last_error_type, last_error_msg = "Forbidden", f"403 - {error_code or 'access denied'}"
-                    break  # not retryable either way
-
-                if resp.status_code == 404:
-                    last_error_type, last_error_msg = "NotFound", f"Attachment {attachment_id} not found (404)"
-                    break  # not retryable
-
-                resp.raise_for_status()
-
-                # Stream the body straight to S3 instead of buffering the
-                # whole attachment in memory first -- important under thread
-                # concurrency where several large attachments could otherwise
-                # be fully buffered at once. Config caps boto3's internal
-                # multipart thread pool (see S3_TRANSFER_CONFIG comment above).
-                # The stream is wrapped to count bytes as they pass through,
-                # so we can confirm the full body actually made it to S3.
-                resp.raw.decode_content = True
-                counting_stream = _CountingStream(resp.raw)
-                s3_client.upload_fileobj(
-                    counting_stream, OUTPUT_BUCKET, s3_key,
-                    ExtraArgs={"ContentType": content_type},
-                    Config=S3_TRANSFER_CONFIG,
-                )
-
-                if body_length is not None and counting_stream.bytes_read != body_length:
-                    # A short/long read usually means a dropped connection
-                    # mid-stream or a proxy that truncated the response.
-                    # Treat it as retryable rather than landing a corrupt
-                    # file as a "success" -- the next attempt's upload will
-                    # overwrite this same S3 key.
-                    last_error_type = "BodyLengthMismatch"
-                    last_error_msg = (
-                        f"Expected BodyLength={body_length} but streamed "
-                        f"{counting_stream.bytes_read} bytes to S3"
-                    )
-                    time.sleep(BACKOFF_BASE * attempt + random.uniform(0, 0.5))
-                    continue
-
-                success = True
-                break
-
-            except requests.exceptions.RequestException as e:
-                last_error_type, last_error_msg = "HTTPError", str(e)[:500]
-            except Exception as e:  # noqa: BLE001 - broad catch, boto3/S3 errors etc.
-                last_error_type, last_error_msg = type(e).__name__, str(e)[:500]
-            finally:
-                if resp is not None:
-                    resp.close()
-
-            time.sleep(BACKOFF_BASE * attempt + random.uniform(0, 0.5))
-
-        if success:
-            return {
-                "AttachmentId": attachment_id, "ParentId": parent_id, "FileName": filename,
-                "ContentType": content_type, "BodyLength": body_length,
-                "CreatedDate": created_date,
-                "S3RelativePath": s3_key, "S3AbsolutePath": s3_abs_path, "Status": "SUCCESS",
-                "ErrorType": None, "ErrorMessage": None, "Attempts": attempt,
-                "Timestamp": dt.datetime.utcnow().isoformat(),
-            }
-        return fail(last_error_type or "UnknownError",
-                    last_error_msg or "Exhausted retries with no specific error captured",
-                    attempts=MAX_ROW_RETRIES, filename=filename)
-
-    def record(result: dict):
-        if result["Status"] == "SUCCESS":
-            success_rows.append(result)
-        else:
-            failed_rows.append(result)
-
-    def workable_rows():
-        # Corrupt rows never had a usable Id/ParentId, so route them straight
-        # to the FAILED list without ever occupying a thread-pool slot.
-        for row in row_iter:
-            if row["_corrupt_record"] is not None:
-                failed_rows.append(_corrupt_row_dict(row))
-            else:
-                yield row
-
-    work_iter = workable_rows()
-
-    # OPTIMIZATION: sliding-window submission instead of fixed batches.
-    #
-    # A fixed-batch pattern (submit N futures, block on as_completed() for
-    # the whole batch, submit the next N) lets one slow row stall the entire
-    # pool at every batch boundary -- other workers finish their share of the
-    # batch and then sit idle waiting for the straggler before the executor
-    # is given any more work. Instead, keep a fixed number of futures in
-    # flight (a small multiple of THREAD_POOL_SIZE) and top the pool back up
-    # to that level every time any single future completes, so a slow row
-    # only ever idles its own worker slot, never the rest of the pool.
-    max_in_flight = THREAD_POOL_SIZE * MAX_IN_FLIGHT_MULTIPLIER
-    try:
-        with ThreadPoolExecutor(max_workers=THREAD_POOL_SIZE) as executor:
-            in_flight = set()
-
-            for row in itertools.islice(work_iter, max_in_flight):
-                in_flight.add(executor.submit(process_row, row))
-
-            while in_flight:
-                done, in_flight = wait(in_flight, return_when=FIRST_COMPLETED)
-                for future in done:
-                    record(future.result())
-                for row in itertools.islice(work_iter, len(done)):
-                    in_flight.add(executor.submit(process_row, row))
-    finally:
-        session.close()
-
-    # This is the durability mechanism: write this partition's results the
-    # moment it's done, independent of every other partition's fate.
-    _write_manifest_csv(s3_client, SUCCESS_BUCKET, SUCCESS_PREFIX, partition_id, success_rows)
-    _write_manifest_csv(s3_client, FAILED_BUCKET, FAILED_PREFIX, partition_id, failed_rows)
-    SUCCESS_ACC.add(len(success_rows))
-    FAILED_ACC.add(len(failed_rows))
-
-
-# --------------------------------------------------------------------------- #
-# Main
-# --------------------------------------------------------------------------- #
-
-def main():
-    logger.info(f"Reading input CSV from {INPUT_CSV_PATH}")
-    logger.info(f"Manifests for this run will be written under run={JOB_RUN_ID}/")
-
-    # Full Attachment object schema (minus Body, which is fetched per-row via
-    # the REST API rather than carried in the CSV). Declared as StringType
-    # except BodyLength (needed for the byte-count check) and _corrupt_record,
-    # so a stray non-boolean/date value in a column we don't use can't itself
-    # cause a parse failure -- only actually malformed CSV structure should
-    # route a row to _corrupt_record.
+def run_manifest_reconciliation():
     input_schema = StructType([
         StructField("Id", StringType(), True),
         StructField("ParentId", StringType(), True),
@@ -801,7 +221,7 @@ def main():
         StructField("_corrupt_record", StringType(), True),
     ])
 
-    df = (
+    input_df = (
         spark.read
         .option("header", "true")
         .option("enforceSchema", "false")
@@ -810,43 +230,301 @@ def main():
         .schema(input_schema)
         .csv(INPUT_CSV_PATH)
     )
+    # Same definition of a "processable" row the downloader used: not a
+    # corrupt CSV row, and has a non-null Id. Corrupt/null-Id rows are the
+    # downloader's own responsibility to have routed to FAILED with
+    # MalformedCsvRow / never emitted at all -- they're out of scope for
+    # "did every processable row get a manifest entry".
+    input_ids_df = (
+        input_df
+        .filter(F.col("_corrupt_record").isNull())
+        .filter(F.col("Id").isNotNull())
+        .select(F.col("Id").alias("AttachmentId"))
+        .distinct()
+    )
+    input_total = input_ids_df.count()
 
-    if df.rdd.isEmpty():
-        logger.warn(f"Input CSV at {INPUT_CSV_PATH} is empty -- nothing to process.")
-        job.commit()
-        return
+    success_df = spark.read.option("header", "true").csv(SUCCESS_OUTPUT_PATH)
+    failed_df = spark.read.option("header", "true").csv(FAILED_OUTPUT_PATH)
 
-    # OPTIMIZATION: the CSV carries the full Attachment object, but only
-    # these columns are used for processing (plus _corrupt_record, needed to
-    # detect malformed rows). Selecting down before the repartition shuffle
-    # keeps the shuffle payload small instead of dragging OwnerId,
-    # Description, audit timestamps, etc. through every partition boundary
-    # for 4M+ rows.
-    #
-    # NOTE: rows with a null/malformed Id are deliberately NOT filtered out
-    # here (unlike an earlier version of this job). They still need to reach
-    # process_partition so validation failures are recorded in the FAILED
-    # manifest -- silently dropping them at this stage would make them
-    # vanish from every manifest instead.
-    df = df.select(
-        "Id", "ParentId", "Name", "ContentType", "BodyLength", "CreatedDate", "_corrupt_record",
+    success_ids = success_df.select("AttachmentId").filter(F.col("AttachmentId").isNotNull())
+    failed_ids = failed_df.select("AttachmentId").filter(F.col("AttachmentId").isNotNull())
+
+    success_count = success_ids.count()
+    failed_count = failed_ids.count()
+
+    # Duplicates WITHIN each manifest.
+    dup_success = (
+        success_ids.groupBy("AttachmentId").count()
+        .filter(F.col("count") > 1)
+        .withColumn("IssueType", F.lit("DUPLICATE_IN_SUCCESS"))
+    )
+    dup_failed = (
+        failed_ids.groupBy("AttachmentId").count()
+        .filter(F.col("count") > 1)
+        .withColumn("IssueType", F.lit("DUPLICATE_IN_FAILED"))
     )
 
-    # Repartition to control download concurrency. Effective concurrency is
-    # roughly (partitions running concurrently on the cluster) x THREAD_POOL_SIZE,
-    # and should stay <= your Salesforce org's concurrent long-running API
-    # request limit (default is often 25, higher for larger editions -- check
-    # your org's limits). Prefer scaling THREAD_POOL_SIZE for I/O concurrency
-    # per executor core, and NUM_PARTITIONS mainly to spread work evenly
-    # across the cluster.
-    df = df.repartition(NUM_PARTITIONS)
+    # An AttachmentId appearing in BOTH manifests is a contract violation --
+    # a row should resolve to exactly one terminal state.
+    dup_across = (
+        success_ids.distinct().join(failed_ids.distinct(), on="AttachmentId", how="inner")
+        .withColumn("count", F.lit(2))
+        .withColumn("IssueType", F.lit("DUPLICATE_ACROSS_SUCCESS_AND_FAILED"))
+    )
 
-    # Single action for the whole job. No data is collected back to the
-    # driver -- each partition writes its own manifest files directly to S3
-    # as a side effect (see process_partition / _write_manifest_csv).
-    df.rdd.foreachPartition(process_partition)
+    # Input rows with no matching entry in either manifest at all -- these
+    # are the ones you can't even see in a FAILED manifest to retry; usually
+    # means a partition-level crash that Spark's task retries eventually
+    # gave up on (exceeding spark.task.maxFailures) rather than falling
+    # through to the downloader's own per-row/per-partition error handling.
+    accounted_ids = success_ids.distinct().union(failed_ids.distinct()).distinct()
+    missing_df = (
+        input_ids_df.join(accounted_ids, on="AttachmentId", how="left_anti")
+        .withColumn("count", F.lit(0))
+        .withColumn("IssueType", F.lit("MISSING_FROM_MANIFESTS"))
+    )
 
-    logger.info(f"Done. SUCCESS={SUCCESS_ACC.value} FAILED={FAILED_ACC.value} (see manifests for authoritative detail)")
+    discrepancies_df = dup_success.unionByName(dup_failed).unionByName(dup_across).unionByName(missing_df)
+    discrepancy_count = discrepancies_df.count()
+
+    if discrepancy_count:
+        (
+            discrepancies_df
+            .coalesce(1)
+            .write.mode("overwrite").option("header", "true")
+            .csv(f"{VERIFICATION_OUTPUT_PATH.rstrip('/')}/discrepancies/manifest/{JOB_NAME}/")
+        )
+
+    return {
+        "input_total_processable_rows": input_total,
+        "success_manifest_rows": success_count,
+        "failed_manifest_rows": failed_count,
+        "manifest_sum_vs_input_diff": input_total - (success_count + failed_count),
+        "duplicate_in_success_count": dup_success.count(),
+        "duplicate_in_failed_count": dup_failed.count(),
+        "duplicate_across_manifests_count": dup_across.count(),
+        "missing_from_manifests_count": missing_df.count(),
+        "manifest_reconciliation_clean": discrepancy_count == 0,
+    }, success_df
+
+
+# --------------------------------------------------------------------------- #
+# Step 2: S3 REALITY CHECK (per-partition, threaded HEAD requests)
+# --------------------------------------------------------------------------- #
+
+VERIFY_RESULT_FIELDS = [
+    "AttachmentId", "ParentId", "FileName", "S3RelativePath", "ExpectedKey",
+    "ManifestBodyLength", "S3ContentLength", "VerifyStatus", "Detail",
+]
+
+
+def verify_partition(partition_id, rows):
+    row_iter = iter(rows)
+    try:
+        first_row = next(row_iter)
+    except StopIteration:
+        return
+    row_iter = itertools.chain([first_row], row_iter)
+
+    try:
+        s3_client = boto3.client(
+            "s3",
+            config=BotoConfig(
+                max_pool_connections=THREAD_POOL_SIZE,
+                connect_timeout=REQUEST_CONNECT_TIMEOUT,
+                read_timeout=REQUEST_READ_TIMEOUT,
+                retries={"max_attempts": 3, "mode": "standard"},
+            ),
+        )
+    except Exception as e:  # noqa: BLE001
+        for row in row_iter:
+            yield Row(
+                AttachmentId=row["AttachmentId"], ParentId=row["ParentId"],
+                FileName=row["FileName"], S3RelativePath=row["S3RelativePath"],
+                ExpectedKey=None, ManifestBodyLength=row["BodyLength"],
+                S3ContentLength=None, VerifyStatus="HEAD_ERROR",
+                Detail=f"Partition setup failed: {str(e)[:300]}",
+            )
+        return
+
+    def verify_row(row) -> Row:
+        attachment_id = row["AttachmentId"]
+        parent_id = row["ParentId"]
+        filename = row["FileName"]
+        s3_key = row["S3RelativePath"]
+        manifest_body_length = row["BodyLength"]
+        created_date = row["CreatedDate"]
+
+        def result(status, detail, s3_len=None, expected_key=None):
+            return Row(
+                AttachmentId=attachment_id, ParentId=parent_id, FileName=filename,
+                S3RelativePath=s3_key, ExpectedKey=expected_key,
+                ManifestBodyLength=manifest_body_length, S3ContentLength=s3_len,
+                VerifyStatus=status, Detail=detail,
+            )
+
+        if not s3_key:
+            return result("MISSING_IN_S3", "Manifest row has no S3RelativePath")
+
+        # Recompute the key the downloader SHOULD have produced for this row
+        # and flag disagreement -- catches a manifest CSV that's stale, hand-
+        # edited, or was regenerated with different ATTACHMENT_ROOT/filename
+        # sanitization than what actually wrote the object.
+        year, month = parse_year_month(created_date)
+        safe_name = sanitize_filename(filename, f"{attachment_id}.bin")
+        expected_key = build_expected_s3_key(
+            ATTACHMENT_ROOT, year, month, parent_id, attachment_id, safe_name
+        )
+        key_matches = (expected_key == s3_key)
+
+        try:
+            head = s3_client.head_object(Bucket=OUTPUT_BUCKET, Key=s3_key)
+        except ClientError as e:
+            code = e.response.get("Error", {}).get("Code", "")
+            if code in ("404", "NoSuchKey", "NotFound"):
+                return result("MISSING_IN_S3", "Object not found in S3", expected_key=expected_key)
+            return result("HEAD_ERROR", f"{code}: {str(e)[:300]}", expected_key=expected_key)
+        except Exception as e:  # noqa: BLE001
+            return result("HEAD_ERROR", str(e)[:300], expected_key=expected_key)
+
+        s3_len = head.get("ContentLength")
+
+        if not key_matches:
+            return result("KEY_MISMATCH", "Manifest S3RelativePath disagrees with recomputed key",
+                          s3_len=s3_len, expected_key=expected_key)
+
+        if manifest_body_length is not None and s3_len is not None and s3_len != manifest_body_length:
+            return result(
+                "SIZE_MISMATCH",
+                f"Manifest BodyLength={manifest_body_length} but S3 ContentLength={s3_len}",
+                s3_len=s3_len, expected_key=expected_key,
+            )
+
+        return result("VERIFIED", "OK", s3_len=s3_len, expected_key=expected_key)
+
+    max_in_flight = THREAD_POOL_SIZE * MAX_IN_FLIGHT_MULTIPLIER
+    with ThreadPoolExecutor(max_workers=THREAD_POOL_SIZE) as executor:
+        in_flight = set()
+        for row in itertools.islice(row_iter, max_in_flight):
+            in_flight.add(executor.submit(verify_row, row))
+        while in_flight:
+            done, in_flight = wait(in_flight, return_when=FIRST_COMPLETED)
+            for future in done:
+                yield future.result()
+            for row in itertools.islice(row_iter, len(done)):
+                in_flight.add(executor.submit(verify_row, row))
+
+
+def run_s3_reality_check(success_df):
+    check_df = success_df.select(
+        "AttachmentId", "ParentId", "FileName", "S3RelativePath",
+        "BodyLength", "CreatedDate",
+    )
+    # BodyLength arrives as a string from the manifest CSV read -- cast back
+    # so the numeric comparison against S3's ContentLength is apples-to-apples.
+    check_df = check_df.withColumn("BodyLength", F.col("BodyLength").cast(LongType()))
+
+    if SAMPLE_RATE < 1.0:
+        check_df = check_df.sample(withReplacement=False, fraction=SAMPLE_RATE, seed=42)
+        logger.info(f"SAMPLE_RATE={SAMPLE_RATE}: verifying a sampled subset of SUCCESS rows against S3.")
+
+    check_df = check_df.repartition(NUM_PARTITIONS)
+
+    result_schema = StructType([
+        StructField("AttachmentId", StringType(), True),
+        StructField("ParentId", StringType(), True),
+        StructField("FileName", StringType(), True),
+        StructField("S3RelativePath", StringType(), True),
+        StructField("ExpectedKey", StringType(), True),
+        StructField("ManifestBodyLength", LongType(), True),
+        StructField("S3ContentLength", LongType(), True),
+        StructField("VerifyStatus", StringType(), True),
+        StructField("Detail", StringType(), True),
+    ])
+
+    verify_rdd = check_df.rdd.mapPartitionsWithIndex(verify_partition)
+    verify_df = spark.createDataFrame(verify_rdd, schema=result_schema).persist()
+
+    total_checked = verify_df.count()
+    by_status = {
+        r["VerifyStatus"]: r["count"]
+        for r in verify_df.groupBy("VerifyStatus").count().collect()
+    }
+    verified_count = by_status.get("VERIFIED", 0)
+
+    bad_df = verify_df.filter(F.col("VerifyStatus") != "VERIFIED")
+    bad_count = bad_df.count()
+    if bad_count:
+        (
+            bad_df.coalesce(1).write.mode("overwrite").option("header", "true")
+            .csv(f"{VERIFICATION_OUTPUT_PATH.rstrip('/')}/discrepancies/s3/{JOB_NAME}/")
+        )
+
+    verify_df.unpersist()
+
+    return {
+        "s3_rows_checked": total_checked,
+        "s3_sample_rate_used": SAMPLE_RATE,
+        "s3_verified_ok_count": verified_count,
+        "s3_status_breakdown": by_status,
+        "s3_check_clean": bad_count == 0,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Main
+# --------------------------------------------------------------------------- #
+
+def main():
+    run_start_ts = dt.datetime.utcnow().isoformat()
+    logger.info(f"Starting verification for job_name={JOB_NAME}")
+
+    manifest_stats, success_df = run_manifest_reconciliation()
+    logger.info(f"Manifest reconciliation: {manifest_stats}")
+
+    success_df = success_df.persist()
+    s3_stats = run_s3_reality_check(success_df)
+    logger.info(f"S3 reality check: {s3_stats}")
+    success_df.unpersist()
+
+    run_end_ts = dt.datetime.utcnow().isoformat()
+    try:
+        duration = (dt.datetime.fromisoformat(run_end_ts) - dt.datetime.fromisoformat(run_start_ts)).total_seconds()
+    except Exception:
+        duration = None
+
+    overall_clean = manifest_stats["manifest_reconciliation_clean"] and s3_stats["s3_check_clean"]
+
+    summary = {
+        "job_name": JOB_NAME,
+        "glue_job_run_name": ARGS["JOB_NAME"],
+        "input_csv_path": INPUT_CSV_PATH,
+        "success_manifest_path": SUCCESS_OUTPUT_PATH,
+        "failed_manifest_path": FAILED_OUTPUT_PATH,
+        "attachment_bucket": OUTPUT_BUCKET,
+        "attachment_root": ATTACHMENT_ROOT,
+        "run_start_ts": run_start_ts,
+        "run_end_ts": run_end_ts,
+        "duration_seconds": duration,
+        "overall_clean": overall_clean,
+        **manifest_stats,
+        **s3_stats,
+    }
+
+    key = f"{VERIFY_PREFIX}/summary/{JOB_NAME}_{run_end_ts.replace(':', '-')}.json"
+    try:
+        boto3.client("s3").put_object(
+            Bucket=VERIFY_BUCKET, Key=key,
+            Body=json.dumps(summary, default=str).encode("utf-8"),
+            ContentType="application/json",
+        )
+        logger.info(f"Wrote verification summary to s3://{VERIFY_BUCKET}/{key}")
+    except Exception as e:  # noqa: BLE001
+        logger.warn(f"Failed to write verification summary: {e}")
+
+    logger.info(f"VERIFICATION {'PASSED' if overall_clean else 'FAILED'} -- see summary above / in S3.")
+
     job.commit()
 
 
