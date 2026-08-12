@@ -1,56 +1,34 @@
-from pyspark.sql import SparkSession
-from pyspark.sql.functions import row_number, col
-from pyspark.sql.window import Window
+import requests
 
-# Create Spark session (not needed in AWS Glue Job if spark already exists)
-spark = SparkSession.builder.getOrCreate()
+def get_access_token(instance_url, client_id, client_secret):
+    resp = requests.post(
+        f"{instance_url}/services/oauth2/token",
+        data={
+            "grant_type": "client_credentials",
+            "client_id": client_id,
+            "client_secret": client_secret,
+        },
+    )
+    resp.raise_for_status()
+    return resp.json()
 
-# Read CSV from S3
-df = (
-    spark.read
-         .option("header", "true")
-         .option("inferSchema", "true")
-         .csv("s3://your-bucket/input/data.csv")
-)
+def describe_object(instance_url, access_token, object_name):
+    url = f"{instance_url}/services/data/v60.0/sobjects/{object_name}/describe"
+    headers = {"Authorization": f"Bearer {access_token}"}
+    resp = requests.get(url, headers=headers)
+    resp.raise_for_status()
+    return resp.json()
 
-# Add row numbers based on an ordering column
-window_spec = Window.orderBy("id")  # Replace "id" with your ordering column
+def describe_all_objects(instance_url, access_token):
+    url = f"{instance_url}/services/data/v60.0/sobjects"
+    headers = {"Authorization": f"Bearer {access_token}"}
+    resp = requests.get(url, headers=headers)
+    resp.raise_for_status()
+    return resp.json()
 
-df = df.withColumn(
-    "row_num",
-    row_number().over(window_spec)
-)
+auth = get_access_token("https://your-domain.my.salesforce.com", "CLIENT_ID", "CLIENT_SECRET")
+token = auth["access_token"]
+inst_url = auth["instance_url"]
 
-# First 5 lakh rows
-df_part1 = (
-    df.filter(col("row_num") <= 500000)
-      .drop("row_num")
-)
-
-# Remaining rows
-df_part2 = (
-    df.filter(col("row_num") > 500000)
-      .drop("row_num")
-)
-
-# Write first part as a single CSV
-(
-    df_part1
-    .coalesce(1)
-    .write
-    .mode("overwrite")
-    .option("header", "true")
-    .csv("s3://your-bucket/output/part1/")
-)
-
-# Write remaining rows as a single CSV
-(
-    df_part2
-    .coalesce(1)
-    .write
-    .mode("overwrite")
-    .option("header", "true")
-    .csv("s3://your-bucket/output/part2/")
-)
-
-print("Split completed successfully.")
+account_meta = describe_object(inst_url, token, "Account")
+all_objects = describe_all_objects(inst_url, token)
