@@ -21,10 +21,11 @@ FAILED manifest columns (input to this job):
     LastModifiedDate, SystemModstamp, S3RelativePath, S3AbsolutePath,
     Status, ErrorType, ErrorMessage, Attempts, Timestamp
 
-Downloader's expected input CSV columns (output of this job):
-    Id, ParentId, Name, IsPrivate, ContentType, BodyLength, OwnerId,
-    CreatedDate, CreatedById, LastModifiedDate, LastModifiedById,
-    SystemModstamp, IsDeleted, Description
+Final output column order (as required by the downstream consumer of this
+job's retry CSV):
+    Id, IsDeleted, ParentId, Name, IsPrivate, ContentType, BodyLength,
+    OwnerId, CreatedDate, CreatedById, LastModifiedDate, LastModifiedById,
+    SystemModstamp, Description, IsEncrypted
 
 Column mapping (FAILED manifest -> retry input):
     AttachmentId      -> Id
@@ -35,11 +36,12 @@ Column mapping (FAILED manifest -> retry input):
     CreatedDate       -> CreatedDate
     LastModifiedDate  -> LastModifiedDate
     SystemModstamp    -> SystemModstamp
-    (no source)       -> IsPrivate, OwnerId, CreatedById, LastModifiedById,
-                          IsDeleted, Description  (not carried in the FAILED
-                          manifest, written out as null -- the downloader
-                          never reads these columns, they only exist so the
-                          CSV can double as a straight Attachment extract)
+    (no source)       -> IsDeleted, IsPrivate, OwnerId, CreatedById,
+                          LastModifiedById, Description, IsEncrypted  (not
+                          carried in the FAILED manifest, written out as
+                          null -- the downloader doesn't read these columns,
+                          they only exist so the CSV can double as a
+                          straight Attachment extract)
 
 Batch discovery:
     - FAILED_INPUT_ROOT is treated as a prefix containing one subfolder per
@@ -320,8 +322,13 @@ def main():
             "collapsed to their most recent failure."
         )
 
+    # Column order here matches the required final output schema exactly:
+    # Id, IsDeleted, ParentId, Name, IsPrivate, ContentType, BodyLength,
+    # OwnerId, CreatedDate, CreatedById, LastModifiedDate, LastModifiedById,
+    # SystemModstamp, Description, IsEncrypted
     retry_df = deduped_df.select(
         F.col("AttachmentId").alias("Id"),
+        F.lit(None).cast(StringType()).alias("IsDeleted"),
         F.col("ParentId").alias("ParentId"),
         F.col("FileName").alias("Name"),
         F.lit(None).cast(StringType()).alias("IsPrivate"),
@@ -333,8 +340,8 @@ def main():
         F.col("LastModifiedDate").alias("LastModifiedDate"),
         F.lit(None).cast(StringType()).alias("LastModifiedById"),
         F.col("SystemModstamp").alias("SystemModstamp"),
-        F.lit(None).cast(StringType()).alias("IsDeleted"),
         F.lit(None).cast(StringType()).alias("Description"),
+        F.lit(None).cast(StringType()).alias("IsEncrypted"),
     )
 
     written_count = retry_df.count()
