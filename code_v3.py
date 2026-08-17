@@ -1,5 +1,5 @@
 import boto3
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 s3 = boto3.client('s3')
 bucket = 'your-bucket-name'
@@ -9,11 +9,27 @@ def count_prefix(prefix):
     count = 0
     for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
         count += page.get('KeyCount', 0)
-    return count
+    return prefix, count
 
-# Split work across first-level prefixes (folders) run in parallel
-prefixes = ['a/', 'b/', 'c/', ...]  # discover via delimiter listing first
-with ThreadPoolExecutor(max_workers=20) as executor:
-    results = list(executor.map(count_prefix, prefixes))
+# Step 1: discover year= prefixes
+years = s3.list_objects_v2(Bucket=bucket, Delimiter='/')['CommonPrefixes']
+year_prefixes = [y['Prefix'] for y in years]  # e.g. 'year=2014/'
 
-print(f"Total: {sum(results)}")
+# Step 2: discover month= prefixes under each year
+month_prefixes = []
+for yp in year_prefixes:
+    months = s3.list_objects_v2(Bucket=bucket, Prefix=yp, Delimiter='/')
+    month_prefixes += [m['Prefix'] for m in months.get('CommonPrefixes', [])]
+    # e.g. 'year=2014/month=01/'
+
+# Step 3: count each partition in parallel
+results = {}
+with ThreadPoolExecutor(max_workers=30) as executor:
+    futures = {executor.submit(count_prefix, p): p for p in month_prefixes}
+    for future in as_completed(futures):
+        prefix, count = future.result()
+        results[prefix] = count
+        print(f"{prefix}: {count}")
+
+total = sum(results.values())
+print(f"\nTotal files: {total}")
