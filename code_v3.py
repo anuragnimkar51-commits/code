@@ -1,37 +1,81 @@
-id_col = "AttachmentId"   # change to your actual column name
+# ============================================================
+# Cell 1: Session setup (Glue interactive session magics)
+# ============================================================
+%idle_timeout 60
+%glue_version 4.0
+%worker_type G.1X
+%number_of_workers 5
 
-sf_id_pattern = r"^[a-zA-Z0-9]{15}$|^[a-zA-Z0-9]{18}$"
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from pyspark.sql.functions import col, year, month, count
 
-is_valid_expr = (
-    F.col(id_col).isNotNull() &
-    (F.trim(F.col(id_col)) != "") &
-    F.col(id_col).rlike(sf_id_pattern)
+sc = SparkContext.getOrCreate()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+
+# ============================================================
+# Cell 2: Config
+# ============================================================
+INPUT_PATH  = "s3://your-input-bucket/path/to/input.csv"
+OUTPUT_PATH = "s3://your-output-bucket/path/to/output/monthly_counts/"
+DATE_COL    = "created_date"
+DATE_FORMAT = None   # e.g. "yyyy-MM-dd" if auto-cast fails; None = let Spark infer
+
+# ============================================================
+# Cell 3: Read CSV with inferSchema
+# ============================================================
+df = (
+    spark.read
+    .option("header", "true")
+    .option("inferSchema", "true")
+    .csv(INPUT_PATH)
 )
 
-valid_df = df.filter(is_valid_expr)
-invalid_df = df.filter(~is_valid_expr)   # cleaner than subtract() — handles duplicate rows correctly
+print("Row count:", df.count())
+df.printSchema()
+df.show(5, truncate=False)
 
-# ---------------------------------------------------------------
-# 4. Counts
-# ---------------------------------------------------------------
-total_rows = df.count()
-valid_count = valid_df.count()
-distinct_valid_count = valid_df.select(id_col).distinct().count()
-invalid_count = invalid_df.count()
+# ============================================================
+# Cell 4: Parse created_date -> year/month columns
+# ============================================================
+if DATE_FORMAT:
+    df = df.withColumn(DATE_COL, col(DATE_COL).cast("string"))
+    df = df.withColumn(DATE_COL, col(DATE_COL).cast("timestamp"))
+else:
+    df = df.withColumn(DATE_COL, col(DATE_COL).cast("timestamp"))
 
-print(f"Total rows:              {total_rows}")
-print(f"Valid attachment IDs:    {valid_count}")
-print(f"Distinct valid IDs:      {distinct_valid_count}")
-print(f"Invalid/null IDs:        {invalid_count}")
+df = df.withColumn("year", year(col(DATE_COL))) \
+       .withColumn("month", month(col(DATE_COL)))
 
-# ---------------------------------------------------------------
-# 5. Write invalid rows (entire row) to S3 as CSV
-# ---------------------------------------------------------------
-invalid_output_path = "s3a://your-bucket/path/to/invalid_attachment_ids/"
+# Drop rows where date failed to parse
+df = df.filter(col("year").isNotNull())
 
-invalid_df.write \
-    .mode("overwrite") \          # use "append" if you don't want to overwrite previous runs
-    .option("header", "true") \
-    .csv(invalid_output_path)
+# ============================================================
+# Cell 5: GroupBy year + month -> row counts
+# ============================================================
+monthly_counts = (
+    df.groupBy("year", "month")
+      .agg(count("*").alias("row_count"))
+      .orderBy("year", "month")
+)
 
-print(f"Invalid rows written to: {invalid_output_path}")
+monthly_counts.show(50, truncate=False)
+
+# ============================================================
+# Cell 6: Write single CSV to S3
+# ============================================================
+(
+    monthly_counts
+    .coalesce(1)
+    .write
+    .mode("overwrite")
+    .option("header", "true")
+    .csv(OUTPUT_PATH)
+)
+
+print(f"Output written to {OUTPUT_PATH}")
+
+# job.commit()  # uncomment if this notebook backs a Glue Job
