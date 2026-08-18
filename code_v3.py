@@ -1,15 +1,42 @@
-from pyspark.sql import SparkSession
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import boto3
+import sys
 import time
+import boto3
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from botocore.exceptions import ClientError
 
-spark = SparkSession.builder.appName("PartitionFileCountsDistributed").getOrCreate()
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from pyspark.sql.functions import regexp_extract, col
 
-bucket = 'your-bucket-name'
-base_prefix = 'attachment_files/'
+# ---------- Glue job boilerplate ----------
 
-# ---------- Discovery (same as before, runs on driver) ----------
+args = getResolvedOptions(sys.argv, [
+    'JOB_NAME',
+    'BUCKET',
+    'BASE_PREFIX',
+    'YEAR',                # e.g. "2014" — single year to process this run
+    'THREADS_PER_TASK',    # e.g. "10"
+    'NUM_SLICES'           # e.g. "50"
+])
+
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+job.init(args['JOB_NAME'], args)
+
+bucket = args['BUCKET']
+base_prefix = args['BASE_PREFIX']          # e.g. "attachment_files/"
+year = args['YEAR']                        # e.g. "2014"
+threads_per_task = int(args['THREADS_PER_TASK'])
+num_slices_cap = int(args['NUM_SLICES'])
+
+year_prefix = f"{base_prefix}year={year}/"
+print(f"Processing single year prefix: {year_prefix}")
+
+# ---------- Discovery scoped to this year only ----------
 
 def list_common_prefixes(bucket, prefix):
     s3 = boto3.client('s3')
@@ -19,22 +46,24 @@ def list_common_prefixes(bucket, prefix):
         prefixes += [cp['Prefix'] for cp in page.get('CommonPrefixes', [])]
     return prefixes
 
-year_prefixes = list_common_prefixes(bucket, base_prefix)
-month_prefixes = []
-for yp in year_prefixes:
-    month_prefixes += list_common_prefixes(yp) if False else list_common_prefixes(bucket, yp)
+month_prefixes = list_common_prefixes(bucket, year_prefix)
+print(f"Found {len(month_prefixes)} month prefixes under {year_prefix}")
+
+if not month_prefixes:
+    print(f"No month prefixes found under {year_prefix} — check YEAR value. Exiting.")
+    job.commit()
+    sys.exit(0)
 
 id_prefixes = []
 for mp in month_prefixes:
     subs = list_common_prefixes(bucket, mp)
     id_prefixes += subs if subs else [mp]
-
-print(f"Found {len(id_prefixes)} leaf-level prefixes")
+print(f"Found {len(id_prefixes)} leaf-level prefixes for year={year}")
 
 # ---------- Counting function used inside each thread ----------
 
 def count_single_prefix(bucket, prefix, max_retries=5):
-    s3 = boto3.client('s3')  # one client per thread call is fine; boto3 clients are lightweight
+    s3 = boto3.client('s3')
     paginator = s3.get_paginator('list_objects_v2')
     count = 0
     retries = 0
@@ -49,40 +78,55 @@ def count_single_prefix(bucket, prefix, max_retries=5):
                 retries += 1
             else:
                 raise
-    return (prefix, None)  # failed after retries — flag for reprocessing
+    return (prefix, None)
 
 # ---------- mapPartitions: each Spark task spins up its own thread pool ----------
 
 def count_partition(prefixes_iter):
     prefixes = list(prefixes_iter)
     results = []
-    # Threads per task — tune based on testing (start around 20-50)
-    with ThreadPoolExecutor(max_workers=30) as executor:
+    with ThreadPoolExecutor(max_workers=threads_per_task) as executor:
         futures = {executor.submit(count_single_prefix, bucket, p): p for p in prefixes}
         for future in as_completed(futures):
             results.append(future.result())
     return iter(results)
 
-# Fewer, bigger partitions now — threading handles concurrency within each,
-# so you don't need thousands of tiny RDD partitions like the non-threaded version
-num_slices = min(len(id_prefixes), 100)
+num_slices = min(len(id_prefixes), num_slices_cap)
+print(f"Distributing {len(id_prefixes)} prefixes across {num_slices} partitions "
+      f"({threads_per_task} threads/task)")
 
-prefixes_rdd = spark.sparkContext.parallelize(id_prefixes, numSlices=num_slices)
+prefixes_rdd = sc.parallelize(id_prefixes, numSlices=num_slices)
 results_rdd = prefixes_rdd.mapPartitions(count_partition)
-
 results = results_rdd.collect()
 
-# Check for any failures
+# ---------- Retry any failures once, at lower concurrency ----------
+
 failed = [p for p, c in results if c is None]
 if failed:
-    print(f"WARNING: {len(failed)} prefixes failed after retries: {failed[:10]}...")
+    print(f"WARNING: {len(failed)} prefixes failed on first pass — retrying at lower concurrency")
+    retry_rdd = sc.parallelize(failed, numSlices=min(len(failed), 20))
+
+    def count_partition_retry(prefixes_iter):
+        prefixes = list(prefixes_iter)
+        results = []
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            futures = {executor.submit(count_single_prefix, bucket, p): p for p in prefixes}
+            for future in as_completed(futures):
+                results.append(future.result())
+        return iter(results)
+
+    retry_results = retry_rdd.mapPartitions(count_partition_retry).collect()
+    retry_map = dict(retry_results)
+    results = [(p, retry_map.get(p, c) if c is None else c) for p, c in results]
+
+    still_failed = [p for p, c in results if c is None]
+    if still_failed:
+        print(f"WARNING: {len(still_failed)} prefixes still failed after retry: {still_failed[:10]}")
 
 total = sum(c for _, c in results if c is not None)
-print(f"\nTotal files: {total}")
+print(f"\nTotal files for year={year}: {total}")
 
-# ---------- Aggregate and write to S3 ----------
-
-from pyspark.sql.functions import regexp_extract, col
+# ---------- Aggregate and write to S3 (partitioned by year in the output path) ----------
 
 results_df = spark.createDataFrame(
     [(p, c) for p, c in results if c is not None], ["prefix", "count"]
@@ -97,8 +141,12 @@ month_counts_df = results_df.groupBy("year", "month") \
 
 month_counts_df.show(50, truncate=False)
 
+# Write to a year-specific output path so parallel/sequential runs don't overwrite each other
 month_counts_df.coalesce(1).write.mode("overwrite").option("header", True) \
-    .csv(f"s3://{bucket}/reports/partition_file_counts_summary/")
+    .csv(f"s3://{bucket}/reports/partition_file_counts_summary/year={year}/")
 
 results_df.write.mode("overwrite").option("header", True) \
-    .csv(f"s3://{bucket}/reports/partition_file_counts_detail/")
+    .csv(f"s3://{bucket}/reports/partition_file_counts_detail/year={year}/")
+
+print(f"Done for year={year}.")
+job.commit()
