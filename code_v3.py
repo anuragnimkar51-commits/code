@@ -16,9 +16,9 @@ args = getResolvedOptions(sys.argv, [
     'JOB_NAME',
     'BUCKET',
     'BASE_PREFIX',
-    'YEAR',                # e.g. "2014" — single year to process this run
-    'THREADS_PER_TASK',    # e.g. "10"
-    'NUM_SLICES'           # e.g. "50"
+    'YEAR',
+    'THREADS_PER_TASK',
+    'NUM_SLICES'
 ])
 
 sc = SparkContext()
@@ -28,8 +28,8 @@ job = Job(glueContext)
 job.init(args['JOB_NAME'], args)
 
 bucket = args['BUCKET']
-base_prefix = args['BASE_PREFIX']          # e.g. "attachment_files/"
-year = args['YEAR']                        # e.g. "2014"
+base_prefix = args['BASE_PREFIX']
+year = args['YEAR']
 threads_per_task = int(args['THREADS_PER_TASK'])
 num_slices_cap = int(args['NUM_SLICES'])
 
@@ -126,7 +126,7 @@ if failed:
 total = sum(c for _, c in results if c is not None)
 print(f"\nTotal files for year={year}: {total}")
 
-# ---------- Aggregate and write to S3 (partitioned by year in the output path) ----------
+# ---------- Build summary (year/month rollup) only — no detail output ----------
 
 results_df = spark.createDataFrame(
     [(p, c) for p, c in results if c is not None], ["prefix", "count"]
@@ -141,12 +141,10 @@ month_counts_df = results_df.groupBy("year", "month") \
 
 month_counts_df.show(50, truncate=False)
 
-# Write to a year-specific output path so parallel/sequential runs don't overwrite each other
+# Write ONLY the summary CSV — single file, one per year run
 month_counts_df.coalesce(1).write.mode("overwrite").option("header", True) \
     .csv(f"s3://{bucket}/reports/partition_file_counts_summary/year={year}/")
 
-results_df.write.mode("overwrite").option("header", True) \
-    .csv(f"s3://{bucket}/reports/partition_file_counts_detail/year={year}/")
-
+print(f"Summary CSV written to s3://{bucket}/reports/partition_file_counts_summary/year={year}/")
 print(f"Done for year={year}.")
 job.commit()
