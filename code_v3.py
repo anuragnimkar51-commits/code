@@ -6,20 +6,11 @@ from awsglue.utils import getResolvedOptions
 from pyspark.context import SparkContext
 from awsglue.context import GlueContext
 from awsglue.job import Job
-from pyspark.sql.functions import col, trim, lower, expr
+from pyspark.sql.functions import col, trim, lower, expr, year as spark_year, month as spark_month, to_timestamp
 
 # ---------- Glue job boilerplate ----------
 
-args = getResolvedOptions(sys.argv, [
-    'JOB_NAME',
-    'BUCKET',
-    'BASE_PREFIX',       # e.g. "attachment_files/"
-    'YEAR',               # e.g. "2021"
-    'MONTH',               # e.g. "03"  -- must match actual folder naming exactly
-    'MANIFEST_PATH',       # e.g. "s3://your-bucket-name/manifests/2021_03_manifest.csv"
-    'OUTPUT_BUCKET',       # where the discrepancy CSV should be written
-    'OUTPUT_PREFIX'        # e.g. "audit/manifest-discrepancies"
-])
+args = getResolvedOptions(sys.argv, ['JOB_NAME'])
 
 sc = SparkContext()
 glueContext = GlueContext(sc)
@@ -27,17 +18,23 @@ spark = glueContext.spark_session
 job = Job(glueContext)
 job.init(args['JOB_NAME'], args)
 
-bucket = args['BUCKET']
-base_prefix = args['BASE_PREFIX']
-year = args['YEAR']
-month = args['MONTH']
-manifest_path = args['MANIFEST_PATH']
-output_bucket = args['OUTPUT_BUCKET']
-output_prefix = args['OUTPUT_PREFIX'].rstrip('/')
+# ---------- HARDCODED VALUES — edit these directly for testing ----------
+
+bucket = 'your-bucket-name'
+base_prefix = 'attachment_files/'
+year = '2021'
+month = '03'
+manifest_path = 's3://your-bucket-name/manifests/2021_03_manifest.csv'
+output_bucket = 'your-bucket-name'
+output_prefix = 'audit/manifest-discrepancies'
+created_date_col = 'CreatedDate'   # <-- confirm exact column name from manifest_df_full.columns
+
+# ---------------------------------------------------------------------
 
 month_prefix = f"{base_prefix}year={year}/month={month}/"
 print(f"Comparing S3 objects under: {month_prefix}")
 print(f"Against manifest: {manifest_path}")
+print(f"Filtering manifest by {created_date_col} for year={year}, month={month}")
 
 # ---------- Step 1: list every actual object under this month prefix ----------
 
@@ -54,7 +51,7 @@ actual_keys = list_all_keys(bucket, month_prefix)
 print(f"Found {len(actual_keys)} actual objects in S3 under {month_prefix}")
 
 if not actual_keys:
-    print("No objects found under this prefix — check YEAR/MONTH/BASE_PREFIX values. Exiting.")
+    print("No objects found under this prefix — check year/month/base_prefix values. Exiting.")
     job.commit()
     sys.exit(0)
 
@@ -63,53 +60,72 @@ actual_df = actual_df.withColumn("s3_key_norm", trim(lower(col("s3_key"))))
 
 # ---------- Step 2: read the manifest CSV ----------
 
-manifest_df = spark.read.option("header", True).csv(manifest_path)
-print("Manifest columns found:", manifest_df.columns)
+manifest_df_full = spark.read.option("header", True).csv(manifest_path)
+print("Manifest columns found:", manifest_df_full.columns)
 
-# Auto-detect the S3 relative path column — adjust/hardcode if this picks the wrong one
-path_col_candidates = [c for c in manifest_df.columns if "s3" in c.lower() and "path" in c.lower()]
+if created_date_col not in manifest_df_full.columns:
+    raise Exception(
+        f"created_date_col '{created_date_col}' not found in manifest. "
+        f"Columns available: {manifest_df_full.columns}"
+    )
+
+# Auto-detect the S3 relative path column
+path_col_candidates = [c for c in manifest_df_full.columns if "s3" in c.lower() and "path" in c.lower()]
 if not path_col_candidates:
     raise Exception(
         f"Could not find an S3 relative path column in manifest. "
-        f"Columns available: {manifest_df.columns}. "
-        f"Set path_col manually below to fix."
+        f"Columns available: {manifest_df_full.columns}."
     )
 path_col = path_col_candidates[0]
 print(f"Using manifest column '{path_col}' as the S3 relative path")
 
+# ---------- Step 3: filter manifest to only rows Created in this year/month ----------
+
+manifest_df = manifest_df_full.withColumn(
+    "created_ts", to_timestamp(col(created_date_col))
+)
+
+before_filter_count = manifest_df.count()
+
+manifest_df = manifest_df.filter(
+    (spark_year(col("created_ts")) == int(year)) &
+    (spark_month(col("created_ts")) == int(month))
+)
+
+after_filter_count = manifest_df.count()
+print(f"Manifest rows before date filter: {before_filter_count}")
+print(f"Manifest rows after filtering to year={year}, month={month}: {after_filter_count}")
+
+if before_filter_count > 0 and after_filter_count == 0:
+    print(f"WARNING: Date filter matched 0 rows out of {before_filter_count}. "
+          f"Check that '{created_date_col}' parses correctly with to_timestamp(). "
+          f"Sample raw values:")
+    manifest_df_full.select(created_date_col).show(5, truncate=False)
+
 manifest_df = manifest_df.withColumn("manifest_path_norm", trim(lower(col(path_col))))
 
-# ---------- Step 3: find S3 keys with NO match in the manifest ----------
-# Suffix match — manifest stores relative path, S3 key includes full prefix.
-# If your manifest stores the FULL key instead, switch to the exact-match join
-# shown commented out below.
+# ---------- Step 4: find S3 keys with NO match in the (date-filtered) manifest ----------
 
 joined = actual_df.join(
-    manifest_df.select("manifest_path_norm", path_col).withColumnRenamed(path_col, "manifest_original_path"),
+    manifest_df.select("manifest_path_norm", path_col, created_date_col)
+        .withColumnRenamed(path_col, "manifest_original_path"),
     expr("s3_key_norm LIKE concat('%', manifest_path_norm)"),
     how="left_outer"
 )
 
-# --- Alternative: exact match, use instead of the join above if manifest has full keys ---
-# joined = actual_df.join(
-#     manifest_df.select("manifest_path_norm"),
-#     actual_df.s3_key_norm == manifest_df.manifest_path_norm,
-#     how="left_outer"
-# )
-
 extra_files_df = joined.filter(col("manifest_path_norm").isNull()).select("s3_key")
 
 extra_count = extra_files_df.count()
-print(f"Found {extra_count} file(s) in S3 with no manifest match")
+print(f"Found {extra_count} file(s) in S3 with no manifest match for year={year}, month={month}")
 
 if extra_count == 0:
-    print("No discrepancies found — S3 matches manifest exactly.")
+    print("No discrepancies found — S3 matches date-filtered manifest exactly.")
     job.commit()
     sys.exit(0)
 
 extra_files_df.show(50, truncate=False)
 
-# ---------- Step 4: write the extra file(s) to a CSV at the configured output path ----------
+# ---------- Step 5: write the extra file(s) to a CSV at the configured output path ----------
 
 extra_keys = [row['s3_key'] for row in extra_files_df.collect()]
 
